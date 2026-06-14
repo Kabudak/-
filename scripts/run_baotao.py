@@ -182,13 +182,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=100)
     parser.add_argument("--num-sequences", type=int, default=2)
     parser.add_argument("--num-queries-per-seq", type=int, default=8)
-    parser.add_argument("--num-non-seq-tokens", type=int, default=9)
+    parser.add_argument("--num-non-seq-tokens", type=int, default=8)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--field-embed-dim", type=int, default=16)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ffn-hidden", type=int, default=256)
     parser.add_argument("--hyformer-layers", type=int, default=4)
-    parser.add_argument("--seq-encoder-type", choices=("longer", "full_transformer", "swiglu"), default="longer")
+    parser.add_argument("--seq-encoder-type", choices=("longer", "full_transformer", "swiglu", "identity"), default="identity")
     parser.add_argument("--short-seq-len", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=10)
@@ -212,13 +212,13 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     print("...")
-    non_seq_sparse = torch.load(args.data_dir / "non_seq_sparse.pt", weights_only=True)
+    non_seq_sparse = torch.load(args.data_dir / "non_seq_sparse.pt", weights_only=True).long()
     non_seq_dense = torch.load(args.data_dir / "non_seq_dense.pt", weights_only=True)
-    seq_sparse = torch.load(args.data_dir / "seq_sparse.pt", weights_only=True)
-    seq_dense = torch.load(args.data_dir / "seq_dense.pt", weights_only=True)
+    seq_sparse = torch.load(args.data_dir / "seq_sparse.pt", weights_only=True).long()
+    seq_dense = torch.load(args.data_dir / "seq_dense.pt", weights_only=True).float()
     seq_mask = torch.load(args.data_dir / "seq_mask.pt", weights_only=True)
-    labels = torch.load(args.data_dir / "labels.pt", weights_only=True)
-    timestamps = torch.load(args.data_dir / "timestamps.pt", weights_only=True)
+    labels = torch.load(args.data_dir / "labels.pt", weights_only=True).long()
+    timestamps = torch.load(args.data_dir / "timestamps.pt", weights_only=True).long()
 
     with open(args.data_dir / "metadata.json", encoding="utf-8") as f:
         data_meta = json.load(f)
@@ -340,6 +340,15 @@ def main() -> None:
             best_epoch = epoch
             best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
+    neg_sampling_info = data_meta.get("neg_sampling")
+    calibration_note = None
+    if neg_sampling_info and neg_sampling_info.get("neg_ratio", 0) > 0:
+        neg_ratio = neg_sampling_info["neg_ratio"]
+        calibration_note = (
+            f"Predicted probabilities are biased high due to 1:{neg_ratio} negative sampling. "
+            f"To calibrate: p_cal = p / (p + (1 - p) / {neg_ratio})"
+        )
+
     run_meta = {
         **data_meta,
         "args": args_payload,
@@ -357,6 +366,7 @@ def main() -> None:
             "pos_weight_mode": args.pos_weight_mode,
             "pos_weight_value": round(pos_weight_value, 6) if pos_weight is not None else None,
         },
+        "calibration": calibration_note,
     }
     (args.output_dir / "run_metadata.json").write_text(
         json.dumps(run_meta, indent=2, ensure_ascii=False),

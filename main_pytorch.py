@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-VALID_ENCODER_TYPES = {"longer", "full_transformer", "swiglu"}
+VALID_ENCODER_TYPES = {"longer", "full_transformer", "swiglu", "identity"}
 
 
 def ensure_non_empty_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -135,6 +135,13 @@ class SwiGLUEncoder(nn.Module):
         return x + self.ffn(self.norm(x)), ensure_non_empty_mask(mask)
 
 
+class IdentityEncoder(nn.Module):
+    """Direct mapping: pass sequence tokens through as-is, no processing."""
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return x, ensure_non_empty_mask(mask)
+
+
 class SequenceRepresentationEncoder(nn.Module):
     def __init__(
         self,
@@ -152,6 +159,8 @@ class SequenceRepresentationEncoder(nn.Module):
             self.impl = LongerStyleEncoder(d_model=d_model, num_heads=num_heads, ffn_hidden=ffn_hidden, short_seq_len=short_seq_len)
         elif encoder_type == "full_transformer":
             self.impl = FullTransformerEncoder(d_model=d_model, num_heads=num_heads, ffn_hidden=ffn_hidden)
+        elif encoder_type == "identity":
+            self.impl = IdentityEncoder()
         else:
             self.impl = SwiGLUEncoder(d_model=d_model, ffn_hidden=ffn_hidden)
 
