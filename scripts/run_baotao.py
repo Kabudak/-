@@ -4,9 +4,9 @@ import argparse
 import json
 import math
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
-import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -16,9 +16,10 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.taac_hyformer import TAACHyFormerClassifier
-from utils.common import json_ready_args, set_seed, split_indices
+from utils.common import json_ready_args, set_seed
 
 TZ_OFFSET_SEC = 8 * 3600
+THRESHOLD = 0.06
 
 
 def binary_auc_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
@@ -66,63 +67,9 @@ def log_loss_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return float(loss.mean().item())
 
 
-def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> float:
-    preds = (torch.sigmoid(logits) >= 0.5).long()
+def accuracy_from_logits(logits: torch.Tensor, labels: torch.Tensor, threshold: float = THRESHOLD) -> float:
+    preds = (torch.sigmoid(logits) >= threshold).long()
     return float((preds == labels).float().mean().item())
-
-
-def time_split_indices(timestamps: torch.Tensor, val_days: int) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
-    timestamps_np = timestamps.cpu().numpy().astype(np.int64)
-    day_ids = (timestamps_np + TZ_OFFSET_SEC) // 86400
-    unique_days = np.unique(day_ids)
-    if len(unique_days) < 2:
-        raise ValueError("")
-    val_days = max(1, min(val_days, len(unique_days) - 1))
-    val_day_set = set(unique_days[-val_days:].tolist())
-    train_mask = np.array([day not in val_day_set for day in day_ids], dtype=bool)
-    val_mask = ~train_mask
-
-    train_idx = torch.from_numpy(np.nonzero(train_mask)[0]).long()
-    val_idx = torch.from_numpy(np.nonzero(val_mask)[0]).long()
-    if len(train_idx) == 0 or len(val_idx) == 0:
-        raise ValueError("")
-
-    split_meta = {
-        "split_mode": "time",
-        "timezone": "Asia",
-        "val_days": val_days,
-        "train_min_timestamp": int(timestamps[train_idx].min().item()),
-        "train_max_timestamp": int(timestamps[train_idx].max().item()),
-        "val_min_timestamp": int(timestamps[val_idx].min().item()),
-        "val_max_timestamp": int(timestamps[val_idx].max().item()),
-    }
-    return train_idx, val_idx, split_meta
-
-
-def random_split_with_metadata(
-    size: int,
-    timestamps: torch.Tensor,
-    val_ratio: float,
-    seed: int,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
-    train_idx, val_idx = split_indices(size, val_ratio, seed)
-    split_meta = {
-        "split_mode": "random",
-        "val_ratio": val_ratio,
-        "train_min_timestamp": int(timestamps[train_idx].min().item()) if len(train_idx) else 0,
-        "train_max_timestamp": int(timestamps[train_idx].max().item()) if len(train_idx) else 0,
-        "val_min_timestamp": int(timestamps[val_idx].min().item()) if len(val_idx) else 0,
-        "val_max_timestamp": int(timestamps[val_idx].max().item()) if len(val_idx) else 0,
-    }
-    return train_idx, val_idx, split_meta
-
-
-def select_evenly_spaced_indices(size: int, max_rows: int | None) -> torch.Tensor | None:
-    if max_rows is None or max_rows >= size:
-        return None
-    indices = np.linspace(0, size - 1, num=max_rows, dtype=np.int64)
-    indices = np.unique(indices)
-    return torch.from_numpy(indices).long()
 
 
 def run_epoch(
@@ -140,7 +87,9 @@ def run_epoch(
     all_logits: list[torch.Tensor] = []
     all_labels: list[torch.Tensor] = []
 
-    for non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels in loader:
+    fwd_ctx = torch.no_grad() if not is_train else nullcontext()
+    with fwd_ctx:
+      for non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels in loader:
         non_seq_sparse = non_seq_sparse.to(device)
         non_seq_dense = non_seq_dense.to(device)
         seq_sparse = seq_sparse.to(device)
@@ -175,10 +124,39 @@ def run_epoch(
     return total_loss / total_items, auc, ll, acc
 
 
+def load_day(data_dir: Path, day_label: str) -> tuple[torch.Tensor, ...]:
+    """Load all tensors for a single day from its subdirectory."""
+    day_dir = data_dir / day_label
+    return (
+        torch.load(day_dir / "non_seq_sparse.pt", weights_only=True).long(),
+        torch.load(day_dir / "non_seq_dense.pt", weights_only=True),
+        torch.load(day_dir / "seq_sparse.pt", weights_only=True).long(),
+        torch.load(day_dir / "seq_dense.pt", weights_only=True).float(),
+        torch.load(day_dir / "seq_mask.pt", weights_only=True),
+        torch.load(day_dir / "labels.pt", weights_only=True).long(),
+    )
+
+
+def make_loader_from_tensors(
+    non_seq_sparse: torch.Tensor,
+    non_seq_dense: torch.Tensor,
+    seq_sparse: torch.Tensor,
+    seq_dense: torch.Tensor,
+    seq_mask: torch.Tensor,
+    labels: torch.Tensor,
+    batch_size: int,
+    shuffle: bool,
+    num_workers: int,
+) -> DataLoader:
+    dataset = TensorDataset(
+        non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels,
+    )
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="")
+    parser = argparse.ArgumentParser(description="CTR prediction with progressive validation")
     parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data" / "processed")
-    parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=100)
     parser.add_argument("--num-sequences", type=int, default=2)
     parser.add_argument("--num-queries-per-seq", type=int, default=8)
@@ -191,13 +169,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-encoder-type", choices=("longer", "full_transformer", "swiglu", "identity"), default="identity")
     parser.add_argument("--short-seq-len", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--pos-weight-mode", choices=("none", "auto"), default="none")
-    parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--split-mode", choices=("time", "random"), default="time")
-    parser.add_argument("--val-days", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--num-workers", type=int, default=0)
@@ -211,66 +185,31 @@ def main() -> None:
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("...")
-    non_seq_sparse = torch.load(args.data_dir / "non_seq_sparse.pt", weights_only=True).long()
-    non_seq_dense = torch.load(args.data_dir / "non_seq_dense.pt", weights_only=True)
-    seq_sparse = torch.load(args.data_dir / "seq_sparse.pt", weights_only=True).long()
-    seq_dense = torch.load(args.data_dir / "seq_dense.pt", weights_only=True).float()
-    seq_mask = torch.load(args.data_dir / "seq_mask.pt", weights_only=True)
-    labels = torch.load(args.data_dir / "labels.pt", weights_only=True).long()
-    timestamps = torch.load(args.data_dir / "timestamps.pt", weights_only=True).long()
-
+    # ── Read metadata ────────────────────────────────────────────────────
     with open(args.data_dir / "metadata.json", encoding="utf-8") as f:
         data_meta = json.load(f)
 
-    sampled_indices = select_evenly_spaced_indices(len(labels), args.max_rows)
-    if sampled_indices is not None:
-        non_seq_sparse = non_seq_sparse[sampled_indices]
-        non_seq_dense = non_seq_dense[sampled_indices]
-        seq_sparse = seq_sparse[sampled_indices]
-        seq_dense = seq_dense[sampled_indices]
-        seq_mask = seq_mask[sampled_indices]
-        labels = labels[sampled_indices]
-        timestamps = timestamps[sampled_indices]
-
-    if seq_sparse.size(1) != args.num_sequences:
+    progressive_split = data_meta.get("progressive_split")
+    if progressive_split is None:
         raise ValueError(
-            f" num_sequences={args.num_sequences}  {seq_sparse.size(1)}。"
+            "metadata.json does not contain 'progressive_split'. "
+            "Please re-run preprocess_baotao.py to generate per-day split data."
         )
-    if seq_sparse.size(2) != args.seq_len:
-        print(f"seq_len={args.seq_len}， seq_len={seq_sparse.size(2)}")
+    day_splits = progressive_split["days"]
+    num_days = progressive_split["num_days"]
+
+    print(f"Progressive validation: {num_days} days  threshold={THRESHOLD}")
+    for ds in day_splits:
+        print(f"  {ds['day_label']}: samples={ds['num_samples']:,}")
+
+    # ── Validate model config ────────────────────────────────────────────
     expected_non_seq_tokens = len(data_meta["token_groups"])
     if args.num_non_seq_tokens != expected_non_seq_tokens:
         raise ValueError(
-            f"num_non_seq_tokens={args.num_non_seq_tokens} "
-            f"{expected_non_seq_tokens} "
+            f"num_non_seq_tokens mismatch: args={args.num_non_seq_tokens} data={expected_non_seq_tokens}"
         )
 
-    if args.split_mode == "time":
-        train_idx, val_idx, split_meta = time_split_indices(timestamps, args.val_days)
-    else:
-        train_idx, val_idx, split_meta = random_split_with_metadata(len(labels), timestamps, args.val_ratio, args.seed)
-
-    train_dataset = TensorDataset(
-        non_seq_sparse[train_idx],
-        non_seq_dense[train_idx],
-        seq_sparse[train_idx],
-        seq_dense[train_idx],
-        seq_mask[train_idx],
-        labels[train_idx],
-    )
-    val_dataset = TensorDataset(
-        non_seq_sparse[val_idx],
-        non_seq_dense[val_idx],
-        seq_sparse[val_idx],
-        seq_dense[val_idx],
-        seq_mask[val_idx],
-        labels[val_idx],
-    )
-
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-
+    # ── Build model ──────────────────────────────────────────────────────
     model = TAACHyFormerClassifier(
         sparse_field_cardinalities={key: int(value) for key, value in data_meta["sparse_field_cardinalities"].items()},
         non_seq_sparse_fields=list(data_meta["non_seq_sparse_fields"]),
@@ -292,10 +231,18 @@ def main() -> None:
         field_embed_dim=args.field_embed_dim,
     ).to(args.device)
 
-    train_labels = labels[train_idx]
-    pos_count = int(train_labels.sum().item())
-    neg_count = int(len(train_labels) - pos_count)
-    pos_weight_value = neg_count / max(pos_count, 1)
+    # ── Compute pos_weight from training days (1..N-1) ──────────────────
+    train_pos = 0
+    train_neg = 0
+    for day_idx in range(num_days - 1):
+        day_label = day_splits[day_idx]["day_label"]
+        day_labels = torch.load(args.data_dir / day_label / "labels.pt", weights_only=True).long()
+        train_pos += int(day_labels.sum().item())
+        train_neg += int(len(day_labels) - day_labels.sum().item())
+        del day_labels
+
+    train_total = train_pos + train_neg
+    pos_weight_value = train_neg / max(train_pos, 1)
     pos_weight = (
         torch.tensor([pos_weight_value], dtype=torch.float32, device=args.device)
         if args.pos_weight_mode == "auto"
@@ -304,81 +251,146 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    print(f"device={args.device}  samples={len(labels)}")
-    print(f"  train={len(train_dataset)}  val={len(val_dataset)}")
-    print(f"  non_seq_sparse={tuple(non_seq_sparse.shape)}")
-    print(f"  non_seq_dense={tuple(non_seq_dense.shape)}")
-    print(f"  seq_sparse={tuple(seq_sparse.shape)}")
-    print(f"  seq_dense={tuple(seq_dense.shape)}")
-    print(f"  seq_mask={tuple(seq_mask.shape)}")
+    # ── Print config ─────────────────────────────────────────────────────
+    print(f"device={args.device}")
+    print(f"  training_days={num_days - 1}  test_day={day_splits[-1]['day_label']}  "
+          f"train_samples={train_total}  test_samples={day_splits[-1]['num_samples']}")
     if pos_weight is None:
-        print(f"  train_pos_rate={pos_count / max(len(train_labels), 1) * 100:.2f}%  pos_weight=none")
+        print(f"  train_pos_rate={train_pos / max(train_total, 1) * 100:.2f}%  pos_weight=none")
     else:
-        print(f"  train_pos_rate={pos_count / max(len(train_labels), 1) * 100:.2f}%  pos_weight={pos_weight.item():.2f}")
+        print(f"  train_pos_rate={train_pos / max(train_total, 1) * 100:.2f}%  pos_weight={pos_weight.item():.2f}")
     print(
         f"  d_model={args.d_model}  field_embed_dim={args.field_embed_dim} "
         f"layers={args.hyformer_layers}  encoder={args.seq_encoder_type}"
     )
 
-    best_val_auc = float("-inf")
-    best_epoch = 0
-    best_model_state: dict[str, torch.Tensor] | None = None
     args_payload = json_ready_args(args)
 
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_auc, _, train_acc = run_epoch(model, train_loader, criterion, args.device, optimizer)
-        val_loss, val_auc, val_ll, val_acc = run_epoch(model, val_loader, criterion, args.device)
+    # ── Progressive validation training loop ─────────────────────────────
+    # For each day D:
+    #   1. Load day D's tensors
+    #   2. Evaluate with current model (pre-training metrics)
+    #   3. Train on day D (except last day = test-only)
+    #   4. Release day D's tensors to free memory
+    progressive_results = []
 
-        print(
-            f"[epoch {epoch:02d}] "
-            f"train_loss={train_loss:.4f} train_auc={train_auc:.4f} train_acc={train_acc:.4f} | "
-            f"val_loss={val_loss:.4f} val_auc={val_auc:.4f} val_logloss={val_ll:.4f} val_acc={val_acc:.4f}"
+    for day_idx in range(num_days):
+        day_info = day_splits[day_idx]
+        day_label = day_info["day_label"]
+        is_last_day = day_idx == num_days - 1
+
+        # Load this day's data
+        non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, day_labels = load_day(
+            args.data_dir, day_label,
         )
 
-        if not math.isnan(val_auc) and val_auc > best_val_auc:
-            best_val_auc = val_auc
-            best_epoch = epoch
-            best_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-    neg_sampling_info = data_meta.get("neg_sampling")
-    calibration_note = None
-    if neg_sampling_info and neg_sampling_info.get("neg_ratio", 0) > 0:
-        neg_ratio = neg_sampling_info["neg_ratio"]
-        calibration_note = (
-            f"Predicted probabilities are biased high due to 1:{neg_ratio} negative sampling. "
-            f"To calibrate: p_cal = p / (p + (1 - p) / {neg_ratio})"
+        # === EVALUATE before training on this day ===
+        day_neg_rate = float(1.0 - day_labels.float().mean().item())
+        eval_loader = make_loader_from_tensors(
+            non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, day_labels,
+            batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
         )
+        model.eval()
+        eval_loss, eval_auc, eval_ll, eval_acc = run_epoch(
+            model, eval_loader, criterion, args.device, optimizer=None,
+        )
+        progressive_results.append({
+            "day_label": day_label,
+            "day_index": day_idx,
+            "phase": "pre_train_eval",
+            "loss": round(eval_loss, 6),
+            "auc": round(eval_auc, 6) if not math.isnan(eval_auc) else None,
+            "log_loss": round(eval_ll, 6) if not math.isnan(eval_ll) else None,
+            "accuracy": round(eval_acc, 6),
+            "neg_rate": round(day_neg_rate, 4),
+            "num_samples": len(day_labels),
+        })
+        phase_tag = "TEST" if is_last_day else "EVAL"
+        print(f"[{day_label}] {phase_tag:5s}  auc={eval_auc:.4f}  loss={eval_loss:.4f}  "
+              f"logloss={eval_ll:.4f}  acc={eval_acc:.4f}  neg_rate={day_neg_rate:.4f}  n={len(day_labels):,}")
+
+        # === TRAIN on this day (except last day = test-only) ===
+        if not is_last_day:
+            model.train()
+            train_loader = make_loader_from_tensors(
+                non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, day_labels,
+                batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+            )
+            train_loss, train_auc, train_ll, train_acc = run_epoch(
+                model, train_loader, criterion, args.device, optimizer=optimizer,
+            )
+            progressive_results.append({
+                "day_label": day_label,
+                "day_index": day_idx,
+                "phase": "train",
+                "loss": round(train_loss, 6),
+                "auc": round(train_auc, 6) if not math.isnan(train_auc) else None,
+                "log_loss": round(train_ll, 6) if not math.isnan(train_ll) else None,
+                "accuracy": round(train_acc, 6),
+                "num_samples": len(day_labels),
+            })
+            print(f"[{day_label}] TRAIN  auc={train_auc:.4f}  loss={train_loss:.4f}  logloss={train_ll:.4f}  acc={train_acc:.4f}")
+        else:
+            print(f"[{day_label}] TEST-ONLY (no training)")
+
+        # Release this day's tensors to free memory
+        del non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, day_labels
+        del eval_loader
+        if not is_last_day:
+            del train_loader
+
+    # ── Compute summary metrics ──────────────────────────────────────────
+    pre_train_evals = [r for r in progressive_results if r["phase"] == "pre_train_eval"]
+    final_test_result = pre_train_evals[-1]  # Last day = test set
+
+    # Average progressive AUC: days 2..N (skip day 1 since model is untrained)
+    progressive_aucs = [
+        r["auc"] for r in pre_train_evals[1:]
+        if r["auc"] is not None
+    ]
+    avg_progressive_auc = (
+        sum(progressive_aucs) / len(progressive_aucs)
+        if progressive_aucs else float("nan")
+    )
+    final_test_auc = final_test_result["auc"] if final_test_result["auc"] is not None else float("nan")
+
+    # ── Save results ─────────────────────────────────────────────────────
+    final_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     run_meta = {
         **data_meta,
         "args": args_payload,
-        "split": {
-            **split_meta,
-            "train_size": len(train_dataset),
-            "val_size": len(val_dataset),
-            "train_pos_rate": round(pos_count / max(len(train_labels), 1), 6),
-            "val_pos_rate": round(float(labels[val_idx].float().mean().item()), 6),
+        "training_mode": "progressive",
+        "threshold": THRESHOLD,
+        "progressive_results": progressive_results,
+        "summary": {
+            "final_test_auc": round(final_test_auc, 6) if not math.isnan(final_test_auc) else None,
+            "final_test_logloss": final_test_result.get("log_loss"),
+            "final_test_accuracy": final_test_result.get("accuracy"),
+            "avg_progressive_auc": round(avg_progressive_auc, 6) if not math.isnan(avg_progressive_auc) else None,
+            "num_training_days": num_days - 1,
+            "total_train_samples": train_total,
+            "test_samples": day_splits[-1]["num_samples"],
+            "train_pos_rate": round(train_pos / max(train_total, 1), 6),
         },
-        "best_epoch": best_epoch,
-        "best_val_auc": best_val_auc,
         "loss": {
             "name": "BCEWithLogitsLoss",
             "pos_weight_mode": args.pos_weight_mode,
             "pos_weight_value": round(pos_weight_value, 6) if pos_weight is not None else None,
         },
-        "calibration": calibration_note,
     }
     (args.output_dir / "run_metadata.json").write_text(
         json.dumps(run_meta, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    if args.save_checkpoint and best_model_state is not None:
-        ckpt_path = args.output_dir / f"best_model_epoch{best_epoch:02d}_auc{best_val_auc:.4f}.pt"
-        torch.save({"model": best_model_state, "metadata": run_meta}, ckpt_path)
-        print(f" best checkpoint: {ckpt_path}")
+    if args.save_checkpoint:
+        ckpt_path = args.output_dir / f"final_model_test_auc{final_test_auc:.4f}.pt"
+        torch.save({"model": final_model_state, "metadata": run_meta}, ckpt_path)
+        print(f"  checkpoint: {ckpt_path}")
 
-    print(f"\n best_val_auc={best_val_auc:.4f} @ epoch {best_epoch}")
+    print(f"\n  final_test_auc={final_test_auc:.4f}")
+    print(f"  avg_progressive_auc={avg_progressive_auc:.4f}")
 
 
 if __name__ == "__main__":

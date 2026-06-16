@@ -485,135 +485,225 @@ def vectorize_dataset(
     hour_np = (dt_index.hour.to_numpy(dtype=np.float32) / 23.0).astype(np.float32)
     dow_np = (dt_index.dayofweek.to_numpy(dtype=np.float32) / 6.0).astype(np.float32)
 
+    # ── Vectorized non_seq_sparse ────────────────────────────────────────
+    # Bucket-encode all non-seq sparse fields at once via numpy broadcasting.
+    for col_idx, field in enumerate(NON_SEQ_SPARSE_FIELDS):
+        bucket = SPARSE_FIELD_BUCKETS[field]
+        col_np = df[field].astype(np.int64).to_numpy()
+        is_zero = col_np == 0
+        non_seq_sparse_np[:, col_idx] = np.where(
+            is_zero, 0, np.abs(col_np) % bucket + 1
+        ).astype(np.int32)
+
+    # ── Pre-extract user history arrays for fast lookup ──────────────────
+    # Convert the dict-of-lists into arrays for vectorized bisect + indexing.
+    _user_keys = np.array(list(user_histories.keys()), dtype=np.int64)
+    _user_to_idx = {int(k): i for i, k in enumerate(_user_keys)}
+    _click_ts_arrays = [np.array(user_histories[int(k)].click_ts, dtype=np.int64)
+                        for k in _user_keys]
+    _click_event_arrays = [user_histories[int(k)].click_events for k in _user_keys]
+    _expose_ts_arrays = [np.array(user_histories[int(k)].expose_ts, dtype=np.int64)
+                         for k in _user_keys]
+    _expose_event_arrays = [user_histories[int(k)].expose_events for k in _user_keys]
+
+    # Map each row's user to its history index; -1 for unknown users
+    user_history_idx = np.full(n, -1, dtype=np.int64)
     for row_idx in range(n):
-        current_ts = int(timestamps_np[row_idx])
-        current_user = int(users_np[row_idx])
-        target_adgroup = int(target_adgroup_np[row_idx])
-        target_cate = int(target_cate_np[row_idx])
-        target_campaign = int(target_campaign_np[row_idx])
-        target_customer = int(target_customer_np[row_idx])
-        target_brand = int(target_brand_np[row_idx])
+        uid = int(users_np[row_idx])
+        if uid in _user_to_idx:
+            user_history_idx[row_idx] = _user_to_idx[uid]
 
-        history = user_histories.get(current_user)
-        if history is None:
-            click_cut = 0
-            expose_cut = 0
-            click_selected_events: list[tuple[int, int, int, int, int, float, int, int]] = []
-            click_selected_ts: list[int] = []
-            expose_selected_events = []
-            expose_selected_ts = []
-        else:
-            click_cut = bisect_left(history.click_ts, current_ts)
-            expose_cut = bisect_left(history.expose_ts, current_ts)
+    has_history = user_history_idx >= 0
+    rows_with_hist = np.where(has_history)[0]
+    hist_indices = user_history_idx[rows_with_hist]
 
-            click_start = max(0, click_cut - seq_len)
-            expose_start = max(0, expose_cut - seq_len)
+    # ── Vectorized bisect_left for click and expose timestamps ───────────
+    click_cuts = np.zeros(n, dtype=np.int64)
+    expose_cuts = np.zeros(n, dtype=np.int64)
+    click_cuts[rows_with_hist] = np.array([
+        int(np.searchsorted(_click_ts_arrays[hi], timestamps_np[ri], side="left"))
+        for ri, hi in zip(rows_with_hist, hist_indices)
+    ], dtype=np.int64)
+    expose_cuts[rows_with_hist] = np.array([
+        int(np.searchsorted(_expose_ts_arrays[hi], timestamps_np[ri], side="left"))
+        for ri, hi in zip(rows_with_hist, hist_indices)
+    ], dtype=np.int64)
 
-            click_selected_events = history.click_events[click_start:click_cut]
-            click_selected_ts = history.click_ts[click_start:click_cut]
-            expose_selected_events = history.expose_events[expose_start:expose_cut]
-            expose_selected_ts = history.expose_ts[expose_start:expose_cut]
+    # ── Vectorized history summaries for non_seq_dense ───────────────────
+    click_hist_len_log = np.zeros(n, dtype=np.float32)
+    expose_hist_len_log = np.zeros(n, dtype=np.float32)
+    click_last_gap_log = np.zeros(n, dtype=np.float32)
+    expose_last_gap_log = np.zeros(n, dtype=np.float32)
+    click_same_ad_log = np.zeros(n, dtype=np.float32)
+    expose_same_ad_log = np.zeros(n, dtype=np.float32)
+    click_same_cate_log = np.zeros(n, dtype=np.float32)
+    expose_same_cate_log = np.zeros(n, dtype=np.float32)
+    click_same_brand_log = np.zeros(n, dtype=np.float32)
+    expose_same_brand_log = np.zeros(n, dtype=np.float32)
+    click_same_campaign_log = np.zeros(n, dtype=np.float32)
+    expose_same_campaign_log = np.zeros(n, dtype=np.float32)
+    click_same_customer_log = np.zeros(n, dtype=np.float32)
+    expose_same_customer_log = np.zeros(n, dtype=np.float32)
 
-        click_summary = summarize_history(
-            click_selected_events,
-            click_selected_ts,
-            click_cut,
-            current_ts,
-            target_adgroup,
-            target_cate,
-            target_campaign,
-            target_customer,
-            target_brand,
-        )
-        expose_summary = summarize_history(
-            expose_selected_events,
-            expose_selected_ts,
-            expose_cut,
-            current_ts,
-            target_adgroup,
-            target_cate,
-            target_campaign,
-            target_customer,
-            target_brand,
-        )
+    # Compute last-gap (only non-zero for users with history)
+    for arr_idx, ri in enumerate(rows_with_hist):
+        hi = int(hist_indices[arr_idx])
+        cc = int(click_cuts[ri])
+        ec = int(expose_cuts[ri])
+        click_hist_len_log[ri] = math.log1p(cc)
+        expose_hist_len_log[ri] = math.log1p(ec)
+        if cc > 0:
+            click_last_gap_log[ri] = math.log1p(int(timestamps_np[ri]) - int(_click_ts_arrays[hi][cc - 1]))
+        if ec > 0:
+            expose_last_gap_log[ri] = math.log1p(int(timestamps_np[ri]) - int(_expose_ts_arrays[hi][ec - 1]))
 
-        non_seq_sparse_values = {
-            "user": current_user,
-            "adgroup_id": target_adgroup,
-            "cate_id": target_cate,
-            "campaign_id": target_campaign,
-            "customer": target_customer,
-            "brand": target_brand,
-            "pid_id": int(pid_id_np[row_idx]),
-            "final_gender_code": int(profile_gender_np[row_idx]),
-            "age_level": int(profile_age_np[row_idx]),
-            "pvalue_level": int(profile_pvalue_np[row_idx]),
-            "shopping_level": int(profile_shopping_np[row_idx]),
-            "occupation": int(profile_occupation_np[row_idx]),
-            "new_user_class_level": int(profile_new_user_np[row_idx]),
-        }
-        non_seq_sparse_np[row_idx, :] = np.asarray(
-            encode_sparse_values(non_seq_sparse_values, NON_SEQ_SPARSE_FIELDS),
-            dtype=np.int32,
-        )
-        non_seq_dense_np[row_idx, :] = np.asarray(
-            [
-                log1p_nonneg(price_np[row_idx]),
-                float(hour_np[row_idx]),
-                float(dow_np[row_idx]),
-                click_summary[0],
-                expose_summary[0],
-                click_summary[1],
-                expose_summary[1],
-                click_summary[2],
-                expose_summary[2],
-                click_summary[3],
-                expose_summary[3],
-                click_summary[4],
-                expose_summary[4],
-                click_summary[5],
-                expose_summary[5],
-                click_summary[6],
-                expose_summary[6],
-            ],
-            dtype=np.float32,
-        )
+    # Compute same_* counts by scanning the selected history slice for each row
+    for arr_idx, ri in enumerate(rows_with_hist):
+        hi = int(hist_indices[arr_idx])
+        cc = int(click_cuts[ri])
+        ec = int(expose_cuts[ri])
+        c_start = max(0, cc - seq_len)
+        e_start = max(0, ec - seq_len)
+        t_ad = int(target_adgroup_np[ri])
+        t_ca = int(target_cate_np[ri])
+        t_br = int(target_brand_np[ri])
+        t_cp = int(target_campaign_np[ri])
+        t_cu = int(target_customer_np[ri])
 
-        fill_sequence_branch(
-            seq_sparse_np,
-            seq_dense_np,
-            seq_mask_np,
-            row_idx=row_idx,
-            branch_idx=0,
-            selected_events=click_selected_events,
-            selected_ts=click_selected_ts,
-            current_ts=current_ts,
-            target_adgroup=target_adgroup,
-            target_cate=target_cate,
-            target_campaign=target_campaign,
-            target_customer=target_customer,
-            target_brand=target_brand,
-            target_price=float(price_np[row_idx]),
-        )
-        fill_sequence_branch(
-            seq_sparse_np,
-            seq_dense_np,
-            seq_mask_np,
-            row_idx=row_idx,
-            branch_idx=1,
-            selected_events=expose_selected_events,
-            selected_ts=expose_selected_ts,
-            current_ts=current_ts,
-            target_adgroup=target_adgroup,
-            target_cate=target_cate,
-            target_campaign=target_campaign,
-            target_customer=target_customer,
-            target_brand=target_brand,
-            target_price=float(price_np[row_idx]),
-        )
+        # Click history
+        if cc > 0:
+            c_ad = c_ca = c_br = c_cp = c_cu = 0
+            for ev in _click_event_arrays[hi][c_start:cc]:
+                if ev[0] == t_ad: c_ad += 1
+                if ev[1] == t_ca: c_ca += 1
+                if ev[4] == t_br: c_br += 1
+                if ev[2] == t_cp: c_cp += 1
+                if ev[3] == t_cu: c_cu += 1
+            click_same_ad_log[ri] = math.log1p(c_ad)
+            click_same_cate_log[ri] = math.log1p(c_ca)
+            click_same_brand_log[ri] = math.log1p(c_br)
+            click_same_campaign_log[ri] = math.log1p(c_cp)
+            click_same_customer_log[ri] = math.log1p(c_cu)
 
-        if row_idx > 0 and row_idx % 500000 == 0:
-            print(f"    {row_idx:,}/{n:,} ...")
+        # Expose history
+        if ec > 0:
+            e_ad = e_ca = e_br = e_cp = e_cu = 0
+            for ev in _expose_event_arrays[hi][e_start:ec]:
+                if ev[0] == t_ad: e_ad += 1
+                if ev[1] == t_ca: e_ca += 1
+                if ev[4] == t_br: e_br += 1
+                if ev[2] == t_cp: e_cp += 1
+                if ev[3] == t_cu: e_cu += 1
+            expose_same_ad_log[ri] = math.log1p(e_ad)
+            expose_same_cate_log[ri] = math.log1p(e_ca)
+            expose_same_brand_log[ri] = math.log1p(e_br)
+            expose_same_campaign_log[ri] = math.log1p(e_cp)
+            expose_same_customer_log[ri] = math.log1p(e_cu)
+
+    # Fill non_seq_dense
+    non_seq_dense_np[:, 0] = np.log1p(np.maximum(price_np, 0)).astype(np.float32)
+    non_seq_dense_np[:, 1] = hour_np
+    non_seq_dense_np[:, 2] = dow_np
+    non_seq_dense_np[:, 3] = click_hist_len_log
+    non_seq_dense_np[:, 4] = expose_hist_len_log
+    non_seq_dense_np[:, 5] = click_last_gap_log
+    non_seq_dense_np[:, 6] = expose_last_gap_log
+    non_seq_dense_np[:, 7] = click_same_ad_log
+    non_seq_dense_np[:, 8] = expose_same_ad_log
+    non_seq_dense_np[:, 9] = click_same_cate_log
+    non_seq_dense_np[:, 10] = expose_same_cate_log
+    non_seq_dense_np[:, 11] = click_same_brand_log
+    non_seq_dense_np[:, 12] = expose_same_brand_log
+    non_seq_dense_np[:, 13] = click_same_campaign_log
+    non_seq_dense_np[:, 14] = expose_same_campaign_log
+    non_seq_dense_np[:, 15] = click_same_customer_log
+    non_seq_dense_np[:, 16] = expose_same_customer_log
+
+    # ── Vectorized sequence branches ─────────────────────────────────────
+    for arr_idx, ri in enumerate(rows_with_hist):
+        hi = int(hist_indices[arr_idx])
+        cc = int(click_cuts[ri])
+        ec = int(expose_cuts[ri])
+        c_start = max(0, cc - seq_len)
+        e_start = max(0, ec - seq_len)
+        current_ts = int(timestamps_np[ri])
+        t_ad = int(target_adgroup_np[ri])
+        t_ca = int(target_cate_np[ri])
+        t_cp = int(target_campaign_np[ri])
+        t_cu = int(target_customer_np[ri])
+        t_br = int(target_brand_np[ri])
+        t_price = float(price_np[ri])
+
+        # Fill click branch (branch_idx=0)
+        click_evts = _click_event_arrays[hi][c_start:cc]
+        click_tss = _click_ts_arrays[hi][c_start:cc]
+        sel_len = len(click_evts)
+        for step_idx, (event, hist_ts) in enumerate(zip(click_evts, click_tss)):
+            hist_ad, hist_ca, hist_cp, hist_cu, hist_br, hist_price, hist_pid = event
+            hist_price_f = safe_float(hist_price)
+            price_ratio_log = math.log1p(hist_price_f / t_price) if t_price > 0.0 else 0.0
+            relative_position = 0.0 if sel_len <= 1 else step_idx / (sel_len - 1)
+            seq_sparse_np[ri, 0, step_idx, :] = np.asarray(
+                [stable_bucket_id(hist_ad, SPARSE_FIELD_BUCKETS["adgroup_id"]),
+                 stable_bucket_id(hist_ca, SPARSE_FIELD_BUCKETS["cate_id"]),
+                 stable_bucket_id(hist_cp, SPARSE_FIELD_BUCKETS["campaign_id"]),
+                 stable_bucket_id(hist_cu, SPARSE_FIELD_BUCKETS["customer"]),
+                 stable_bucket_id(hist_br, SPARSE_FIELD_BUCKETS["brand"]),
+                 stable_bucket_id(hist_pid, SPARSE_FIELD_BUCKETS["pid_id"])],
+                dtype=np.int32,
+            )
+            seq_dense_np[ri, 0, step_idx, :] = np.asarray(
+                [log1p_nonneg(hist_price_f),
+                 signed_log1p(hist_price_f - t_price),
+                 price_ratio_log,
+                 log1p_nonneg(current_ts - int(hist_ts)),
+                 float(hist_ad == t_ad),
+                 float(hist_ca == t_ca),
+                 float(hist_br == t_br),
+                 float(hist_cp == t_cp),
+                 float(hist_cu == t_cu),
+                 log1p_nonneg(sel_len - step_idx),
+                 float(relative_position)],
+                dtype=np.float16,
+            )
+            seq_mask_np[ri, 0, step_idx] = True
+
+        # Fill expose branch (branch_idx=1)
+        expose_evts = _expose_event_arrays[hi][e_start:ec]
+        expose_tss = _expose_ts_arrays[hi][e_start:ec]
+        sel_len = len(expose_evts)
+        for step_idx, (event, hist_ts) in enumerate(zip(expose_evts, expose_tss)):
+            hist_ad, hist_ca, hist_cp, hist_cu, hist_br, hist_price, hist_pid = event
+            hist_price_f = safe_float(hist_price)
+            price_ratio_log = math.log1p(hist_price_f / t_price) if t_price > 0.0 else 0.0
+            relative_position = 0.0 if sel_len <= 1 else step_idx / (sel_len - 1)
+            seq_sparse_np[ri, 1, step_idx, :] = np.asarray(
+                [stable_bucket_id(hist_ad, SPARSE_FIELD_BUCKETS["adgroup_id"]),
+                 stable_bucket_id(hist_ca, SPARSE_FIELD_BUCKETS["cate_id"]),
+                 stable_bucket_id(hist_cp, SPARSE_FIELD_BUCKETS["campaign_id"]),
+                 stable_bucket_id(hist_cu, SPARSE_FIELD_BUCKETS["customer"]),
+                 stable_bucket_id(hist_br, SPARSE_FIELD_BUCKETS["brand"]),
+                 stable_bucket_id(hist_pid, SPARSE_FIELD_BUCKETS["pid_id"])],
+                dtype=np.int32,
+            )
+            seq_dense_np[ri, 1, step_idx, :] = np.asarray(
+                [log1p_nonneg(hist_price_f),
+                 signed_log1p(hist_price_f - t_price),
+                 price_ratio_log,
+                 log1p_nonneg(current_ts - int(hist_ts)),
+                 float(hist_ad == t_ad),
+                 float(hist_ca == t_ca),
+                 float(hist_br == t_br),
+                 float(hist_cp == t_cp),
+                 float(hist_cu == t_cu),
+                 log1p_nonneg(sel_len - step_idx),
+                 float(relative_position)],
+                dtype=np.float16,
+            )
+            seq_mask_np[ri, 1, step_idx] = True
+
+        if ri > 0 and ri % 500000 == 0:
+            print(f"    {ri:,}/{n:,} ...")
 
     # Keep sparse tensors as int32 for storage; run_baotao.py will .long() at load time.
     labels = torch.from_numpy(labels_np)
@@ -675,68 +765,7 @@ def vectorize_dataset(
     return non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, metadata
 
 
-def save_outputs(
-    output_dir: Path,
-    non_seq_sparse: torch.Tensor,
-    non_seq_dense: torch.Tensor,
-    seq_sparse: torch.Tensor,
-    seq_dense: torch.Tensor,
-    seq_mask: torch.Tensor,
-    labels: torch.Tensor,
-    timestamps: torch.Tensor,
-    metadata: dict,
-) -> None:
-    print("[5/5]")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(non_seq_sparse, output_dir / "non_seq_sparse.pt")
-    torch.save(non_seq_dense, output_dir / "non_seq_dense.pt")
-    torch.save(seq_sparse, output_dir / "seq_sparse.pt")
-    torch.save(seq_dense, output_dir / "seq_dense.pt")
-    torch.save(seq_mask, output_dir / "seq_mask.pt")
-    torch.save(labels, output_dir / "labels.pt")
-    torch.save(timestamps, output_dir / "timestamps.pt")
-
-    (output_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    print(f"  {output_dir}")
-    print(f"  non_seq_sparse: {tuple(non_seq_sparse.shape)}")
-    print(f"  non_seq_dense:  {tuple(non_seq_dense.shape)}")
-    print(f"  seq_sparse:     {tuple(seq_sparse.shape)}")
-    print(f"  seq_dense:      {tuple(seq_dense.shape)}")
-    print(f"  seq_mask:       {tuple(seq_mask.shape)}")
-    print(f"  labels:         {tuple(labels.shape)}")
-    print(f"  timestamps:     {tuple(timestamps.shape)}")
-
-
-def negative_sample(df: pd.DataFrame, neg_ratio: int, seed: int) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Keep all positive samples; randomly sample neg_ratio × (num_positives) negatives."""
-    pos_df = df[df["label"] == 1]
-    neg_df = df[df["label"] == 0]
-    num_pos = len(pos_df)
-    num_neg_target = num_pos * neg_ratio
-
-    if num_neg_target >= len(neg_df):
-        sampled_neg = neg_df
-    else:
-        sampled_neg = neg_df.sample(n=num_neg_target, random_state=seed)
-
-    result = pd.concat([pos_df, sampled_neg], ignore_index=True)
-    result = result.sort_values("time_stamp").reset_index(drop=True)
-
-    stats = {
-        "neg_ratio": neg_ratio,
-        "pos_before": num_pos,
-        "neg_before": len(neg_df),
-        "neg_sampled": len(sampled_neg),
-        "total_after": len(result),
-        "pos_rate_after": round(num_pos / max(len(result), 1), 6),
-    }
-    print(f"  pos={num_pos:,}  neg={len(neg_df):,} → sampled_neg={len(sampled_neg):,}  total={len(result):,}  pos_rate={stats['pos_rate_after']:.4f}")
-    return result, stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -778,22 +807,10 @@ def parse_args() -> argparse.Namespace:
         help="",
     )
     parser.add_argument(
-        "--neg-sample-ratio",
-        type=int,
-        default=5,
-        help="1:neg_sample_ratio positive-to-negative sampling ratio (0 = no sampling)",
-    )
-    parser.add_argument(
-        "--val-days",
-        type=int,
-        default=1,
-        help="Number of last days to use as validation/test set (default=1, i.e. last day)",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for negative sampling",
+        help="Random seed",
     )
     return parser.parse_args()
 
@@ -808,70 +825,149 @@ def main() -> None:
     df = join_tables(raw_sample, ad_feature, user_profile)
     del raw_sample, ad_feature, user_profile
 
-    # [3/7] Time-based split BEFORE building histories & negative sampling
-    #       to prevent data leakage (feature crossing / look-ahead bias).
-    #       Test set = last `val_days` days; Train set = everything before.
+    # [3/7] Per-day split — split all data into per-day DataFrames.
+    #       Progressive validation will evaluate each day before training on it.
     TZ_OFFSET_SEC = 8 * 3600
     timestamps_all = df["time_stamp"].astype(np.int64).values
     day_ids = (timestamps_all + TZ_OFFSET_SEC) // 86400
     unique_days = np.unique(day_ids)
-    val_days = max(1, min(args.val_days, len(unique_days) - 1))
-    val_day_set = set(unique_days[-val_days:].tolist())
-    train_mask = np.array([d not in val_day_set for d in day_ids], dtype=bool)
+    num_days = len(unique_days)
 
-    df_train = df[train_mask].copy()
-    df_val = df[~train_mask].copy()
-    print(f"[3/7] Time split: train={len(df_train):,}  val={len(df_val):,}  "
-          f"val_days={val_days}  unique_days={len(unique_days)}")
+    day_dfs = []
+    for day in unique_days:
+        mask = day_ids == day
+        day_dfs.append(df[mask].copy())
 
-    # [4/7] Build user histories ONLY from training-period data.
-    #       FIX: previously built from full data → training samples could
-    #       peek at future (test-period) user behaviors → data leakage.
-    print("[4/7] Building user histories from TRAINING data only ...")
-    user_histories = build_user_behavior_sequences(df_train)
+    day_sizes = [len(d) for d in day_dfs]
+    print(f"[3/7] Per-day split: {num_days} days  sizes={day_sizes}")
 
-    # [5/7] Negative sampling — done independently per split
-    #       FIX: previously sampled from full data before split → leakage.
-    neg_sample_stats: dict[str, int | None] = {"train": None, "val": None}
-    if args.neg_sample_ratio > 0:
-        ratio = args.neg_sample_ratio
-        print(f"[5/7] Negative sampling (1:{ratio}) per split")
-        df_train, train_stats = negative_sample(df_train, ratio, args.seed)
-        df_val, val_stats = negative_sample(df_val, ratio, args.seed + 1)
-        neg_sample_stats["train"] = train_stats
-        neg_sample_stats["val"] = val_stats
-    else:
-        print("[5/7] Negative sampling skipped (neg_sample_ratio=0)")
+    # [4/7] Build user histories from ALL data.
+    #       The bisect_left() cutoff in vectorize_dataset() ensures each sample
+    #       only sees history from before its own timestamp — no per-sample leakage.
+    #       Using all data gives later-day samples richer historical context.
+    print("[4/7] Building user histories from ALL data (bisect_left prevents leakage) ...")
+    user_histories = build_user_behavior_sequences(df)
 
-    # [6/7] Merge back for vectorization (histories are train-only, so no leakage)
-    df_merged = pd.concat([df_train, df_val], ignore_index=True)
-    df_merged = df_merged.sort_values("time_stamp").reset_index(drop=True)
-    del df_train, df_val
+    # [5/7] Use full data (no negative sampling)
+    print("[5/7] Using full data (no negative sampling)")
 
-    # [7/7] Vectorize
-    non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, metadata = vectorize_dataset(
-        df=df_merged,
-        user_histories=user_histories,
-        seq_len=args.seq_len,
-        num_sequences=args.num_sequences,
-        max_rows=args.max_rows,
-    )
-    del df_merged, user_histories
+    # [6/7] Sort each day's data by timestamp
+    for day_idx in range(num_days):
+        day_dfs[day_idx] = day_dfs[day_idx].sort_values("time_stamp").reset_index(drop=True)
 
-    # Inject sampling info into metadata
-    metadata["neg_sampling"] = neg_sample_stats
+    # [7/7] Vectorize per-day and save to per-day subdirectories
+    day_metas = []
+    total_pos = 0
+    total_neg = 0
+    total_click_nonempty = 0
+    total_expose_nonempty = 0
+    min_ts_all = float("inf")
+    max_ts_all = 0
 
-    # Save
-    save_outputs(
-        output_dir=args.output_dir,
-        non_seq_sparse=non_seq_sparse,
-        non_seq_dense=non_seq_dense,
-        seq_sparse=seq_sparse,
-        seq_dense=seq_dense,
-        seq_mask=seq_mask,
-        labels=labels,
-        timestamps=timestamps,
-        metadata=metadata,
+    for day_idx in range(num_days):
+        day_label = f"day_{day_idx + 1}"
+        day_dir = args.output_dir / day_label
+        day_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[7/7] Vectorizing {day_label} ({len(day_dfs[day_idx]):,} rows) ...")
+        non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, day_meta = vectorize_dataset(
+            df=day_dfs[day_idx],
+            user_histories=user_histories,
+            seq_len=args.seq_len,
+            num_sequences=args.num_sequences,
+            max_rows=None,  # per-day, no subsampling
+        )
+
+        # Save per-day tensors
+        torch.save(non_seq_sparse, day_dir / "non_seq_sparse.pt")
+        torch.save(non_seq_dense, day_dir / "non_seq_dense.pt")
+        torch.save(seq_sparse, day_dir / "seq_sparse.pt")
+        torch.save(seq_dense, day_dir / "seq_dense.pt")
+        torch.save(seq_mask, day_dir / "seq_mask.pt")
+        torch.save(labels, day_dir / "labels.pt")
+        torch.save(timestamps, day_dir / "timestamps.pt")
+
+        n = len(labels)
+        pos = int(labels.sum().item())
+        neg = n - pos
+        click_nonempty = int(seq_mask[:, 0].any(dim=1).sum().item())
+        expose_nonempty = int(seq_mask[:, 1].any(dim=1).sum().item())
+        ts_min = int(timestamps.min().item()) if n else 0
+        ts_max = int(timestamps.max().item()) if n else 0
+
+        total_pos += pos
+        total_neg += neg
+        total_click_nonempty += click_nonempty
+        total_expose_nonempty += expose_nonempty
+        min_ts_all = min(min_ts_all, ts_min)
+        max_ts_all = max(max_ts_all, ts_max)
+
+        day_meta["day_label"] = day_label
+        day_meta["day_index"] = day_idx
+        day_meta["day_id"] = int(unique_days[day_idx])
+        day_meta["num_samples"] = n
+        day_meta["timestamp_range"] = [ts_min, ts_max]
+        day_metas.append(day_meta)
+
+        print(f"  {day_label} saved to {day_dir}")
+        print(f"    non_seq_sparse: {tuple(non_seq_sparse.shape)}")
+        print(f"    non_seq_dense:  {tuple(non_seq_dense.shape)}")
+        print(f"    seq_sparse:     {tuple(seq_sparse.shape)}")
+        print(f"    seq_dense:      {tuple(seq_dense.shape)}")
+        print(f"    seq_mask:       {tuple(seq_mask.shape)}")
+        print(f"    labels:         {tuple(labels.shape)}")
+        print(f"    timestamps:     {tuple(timestamps.shape)}")
+
+    del day_dfs, user_histories
+
+    # Write global metadata
+    metadata = {
+        "dataset": "ad_ctr_public_three_table",
+        "feature_version": "field_aware_hyformer_v2",
+        "history_source": {
+            "source_table": "raw_sample",
+            "available_tables": ["raw_sample", "ad_feature", "user_profile"],
+            "sequence_names": ["click_seq", "exposure_seq"],
+            "note": "Histories are reconstructed from prior ad display/click rows, not from raw_behavior_log.",
+        },
+        "num_samples": total_pos + total_neg,
+        "num_sequences": args.num_sequences,
+        "sequence_names": ["click_seq", "exposure_seq"],
+        "seq_len": args.seq_len,
+        "label_mapping": {"0": 0, "1": 1},
+        "positive_samples": total_pos,
+        "negative_samples": total_neg,
+        "pos_rate": round(total_pos / max(total_pos + total_neg, 1), 6),
+        "samples_with_click_seq": total_click_nonempty,
+        "samples_with_exposure_seq": total_expose_nonempty,
+        "non_seq_sparse_fields": NON_SEQ_SPARSE_FIELDS,
+        "non_seq_dense_fields": NON_SEQ_DENSE_FIELDS,
+        "seq_sparse_fields": SEQ_SPARSE_FIELDS,
+        "seq_dense_fields": SEQ_DENSE_FIELDS,
+        "sparse_field_cardinalities": {field: bucket_size + 1 for field, bucket_size in SPARSE_FIELD_BUCKETS.items()},
+        "token_groups": TOKEN_GROUPS,
+        "time_semantics": {
+            "timezone": "Asia",
+            "timestamp_unit": "seconds",
+        },
+        "time_range": {
+            "min_timestamp": int(min_ts_all) if min_ts_all != float("inf") else 0,
+            "max_timestamp": int(max_ts_all),
+        },
+        "progressive_split": {
+            "split_mode": "progressive_time",
+            "num_days": num_days,
+            "timezone": "Asia",
+            "days": day_metas,
+            "note": "Each day's data is stored in a separate subdirectory (day_1/, day_2/, ...). "
+                    "Progressive validation: evaluate on day D BEFORE training on it. "
+                    "Last day is test-only (no training).",
+        },
+    }
+
+    (args.output_dir / "metadata.json").write_text(
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
 
     print("\n finished")
