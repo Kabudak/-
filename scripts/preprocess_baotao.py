@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 from bisect import bisect_left
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,6 +135,38 @@ class UserHistory:
     click_events: list[tuple[int, int, int, int, int, float, int]]
     expose_ts: list[int]
     expose_events: list[tuple[int, int, int, int, int, float, int]]
+
+
+@dataclass
+class PreparedUserHistories:
+    user_index: pd.Index
+    click_ts_arrays: list[np.ndarray]
+    click_event_arrays: list[list[tuple[int, int, int, int, int, float, int]]]
+    expose_ts_arrays: list[np.ndarray]
+    expose_event_arrays: list[list[tuple[int, int, int, int, int, float, int]]]
+
+
+def prepare_user_histories(user_histories: dict[int, UserHistory]) -> PreparedUserHistories:
+    user_keys = np.array(list(user_histories.keys()), dtype=np.int64)
+    click_ts_arrays: list[np.ndarray] = []
+    click_event_arrays: list[list[tuple[int, int, int, int, int, float, int]]] = []
+    expose_ts_arrays: list[np.ndarray] = []
+    expose_event_arrays: list[list[tuple[int, int, int, int, int, float, int]]] = []
+
+    for key in user_keys:
+        history = user_histories[int(key)]
+        click_ts_arrays.append(np.asarray(history.click_ts, dtype=np.int64))
+        click_event_arrays.append(history.click_events)
+        expose_ts_arrays.append(np.asarray(history.expose_ts, dtype=np.int64))
+        expose_event_arrays.append(history.expose_events)
+
+    return PreparedUserHistories(
+        user_index=pd.Index(user_keys),
+        click_ts_arrays=click_ts_arrays,
+        click_event_arrays=click_event_arrays,
+        expose_ts_arrays=expose_ts_arrays,
+        expose_event_arrays=expose_event_arrays,
+    )
 
 
 def safe_int(value: object) -> int:
@@ -441,7 +474,7 @@ def fill_sequence_branch(
 
 def vectorize_dataset(
     df: pd.DataFrame,
-    user_histories: dict[int, UserHistory],
+    user_histories: dict[int, UserHistory] | PreparedUserHistories,
     seq_len: int,
     num_sequences: int,
     max_rows: int | None,
@@ -495,23 +528,20 @@ def vectorize_dataset(
             is_zero, 0, np.abs(col_np) % bucket + 1
         ).astype(np.int32)
 
-    # ── Pre-extract user history arrays for fast lookup ──────────────────
-    # Convert the dict-of-lists into arrays for vectorized bisect + indexing.
-    _user_keys = np.array(list(user_histories.keys()), dtype=np.int64)
-    _user_to_idx = {int(k): i for i, k in enumerate(_user_keys)}
-    _click_ts_arrays = [np.array(user_histories[int(k)].click_ts, dtype=np.int64)
-                        for k in _user_keys]
-    _click_event_arrays = [user_histories[int(k)].click_events for k in _user_keys]
-    _expose_ts_arrays = [np.array(user_histories[int(k)].expose_ts, dtype=np.int64)
-                         for k in _user_keys]
-    _expose_event_arrays = [user_histories[int(k)].expose_events for k in _user_keys]
+    # Reuse prepared arrays across days. This avoids rebuilding the million-user
+    # lookup structures for every day split.
+    prepared_histories = (
+        user_histories
+        if isinstance(user_histories, PreparedUserHistories)
+        else prepare_user_histories(user_histories)
+    )
+    _click_ts_arrays = prepared_histories.click_ts_arrays
+    _click_event_arrays = prepared_histories.click_event_arrays
+    _expose_ts_arrays = prepared_histories.expose_ts_arrays
+    _expose_event_arrays = prepared_histories.expose_event_arrays
 
-    # Map each row's user to its history index; -1 for unknown users
-    user_history_idx = np.full(n, -1, dtype=np.int64)
-    for row_idx in range(n):
-        uid = int(users_np[row_idx])
-        if uid in _user_to_idx:
-            user_history_idx[row_idx] = _user_to_idx[uid]
+    # Vectorized user -> history index mapping. Unknown users become -1.
+    user_history_idx = prepared_histories.user_index.get_indexer(users_np).astype(np.int64, copy=False)
 
     has_history = user_history_idx >= 0
     rows_with_hist = np.where(has_history)[0]
@@ -765,6 +795,124 @@ def vectorize_dataset(
     return non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, metadata
 
 
+_DAY_WORKER_DFS: list[pd.DataFrame] | None = None
+_DAY_WORKER_HISTORIES: PreparedUserHistories | None = None
+_DAY_WORKER_OUTPUT_DIR: Path | None = None
+_DAY_WORKER_UNIQUE_DAYS: list[int] | None = None
+_DAY_WORKER_SEQ_LEN: int | None = None
+_DAY_WORKER_NUM_SEQUENCES: int | None = None
+
+
+def vectorize_and_save_day(
+    day_idx: int,
+    day_id: int,
+    day_label: str,
+    day_df: pd.DataFrame,
+    prepared_histories: PreparedUserHistories,
+    seq_len: int,
+    num_sequences: int,
+    output_dir: Path,
+) -> dict:
+    day_dir = output_dir / day_label
+    day_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[7/7] Vectorizing {day_label} ({len(day_df):,} rows) ...")
+    non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, day_meta = vectorize_dataset(
+        df=day_df,
+        user_histories=prepared_histories,
+        seq_len=seq_len,
+        num_sequences=num_sequences,
+        max_rows=None,
+    )
+
+    torch.save(non_seq_sparse, day_dir / "non_seq_sparse.pt")
+    torch.save(non_seq_dense, day_dir / "non_seq_dense.pt")
+    torch.save(seq_sparse, day_dir / "seq_sparse.pt")
+    torch.save(seq_dense, day_dir / "seq_dense.pt")
+    torch.save(seq_mask, day_dir / "seq_mask.pt")
+    torch.save(labels, day_dir / "labels.pt")
+    torch.save(timestamps, day_dir / "timestamps.pt")
+
+    n = len(labels)
+    pos = int(labels.sum().item())
+    neg = n - pos
+    click_nonempty = int(seq_mask[:, 0].any(dim=1).sum().item())
+    expose_nonempty = int(seq_mask[:, 1].any(dim=1).sum().item())
+    ts_min = int(timestamps.min().item()) if n else 0
+    ts_max = int(timestamps.max().item()) if n else 0
+
+    day_meta["day_label"] = day_label
+    day_meta["day_index"] = day_idx
+    day_meta["day_id"] = int(day_id)
+    day_meta["num_samples"] = n
+    day_meta["timestamp_range"] = [ts_min, ts_max]
+
+    print(f"  {day_label} saved to {day_dir}")
+    print(f"    non_seq_sparse: {tuple(non_seq_sparse.shape)}")
+    print(f"    non_seq_dense:  {tuple(non_seq_dense.shape)}")
+    print(f"    seq_sparse:     {tuple(seq_sparse.shape)}")
+    print(f"    seq_dense:      {tuple(seq_dense.shape)}")
+    print(f"    seq_mask:       {tuple(seq_mask.shape)}")
+    print(f"    labels:         {tuple(labels.shape)}")
+    print(f"    timestamps:     {tuple(timestamps.shape)}")
+
+    return {
+        "day_meta": day_meta,
+        "pos": pos,
+        "neg": neg,
+        "click_nonempty": click_nonempty,
+        "expose_nonempty": expose_nonempty,
+        "ts_min": ts_min,
+        "ts_max": ts_max,
+    }
+
+
+def init_day_worker(
+    day_dfs: list[pd.DataFrame],
+    prepared_histories: PreparedUserHistories,
+    output_dir: str,
+    unique_days: list[int],
+    seq_len: int,
+    num_sequences: int,
+) -> None:
+    global _DAY_WORKER_DFS
+    global _DAY_WORKER_HISTORIES
+    global _DAY_WORKER_OUTPUT_DIR
+    global _DAY_WORKER_UNIQUE_DAYS
+    global _DAY_WORKER_SEQ_LEN
+    global _DAY_WORKER_NUM_SEQUENCES
+    _DAY_WORKER_DFS = day_dfs
+    _DAY_WORKER_HISTORIES = prepared_histories
+    _DAY_WORKER_OUTPUT_DIR = Path(output_dir)
+    _DAY_WORKER_UNIQUE_DAYS = unique_days
+    _DAY_WORKER_SEQ_LEN = seq_len
+    _DAY_WORKER_NUM_SEQUENCES = num_sequences
+
+
+def vectorize_day_worker(day_idx: int) -> dict:
+    if (
+        _DAY_WORKER_DFS is None
+        or _DAY_WORKER_HISTORIES is None
+        or _DAY_WORKER_OUTPUT_DIR is None
+        or _DAY_WORKER_UNIQUE_DAYS is None
+        or _DAY_WORKER_SEQ_LEN is None
+        or _DAY_WORKER_NUM_SEQUENCES is None
+    ):
+        raise RuntimeError("day worker is not initialized")
+
+    day_label = f"day_{day_idx + 1}"
+    return vectorize_and_save_day(
+        day_idx=day_idx,
+        day_id=int(_DAY_WORKER_UNIQUE_DAYS[day_idx]),
+        day_label=day_label,
+        day_df=_DAY_WORKER_DFS[day_idx],
+        prepared_histories=_DAY_WORKER_HISTORIES,
+        seq_len=_DAY_WORKER_SEQ_LEN,
+        num_sequences=_DAY_WORKER_NUM_SEQUENCES,
+        output_dir=_DAY_WORKER_OUTPUT_DIR,
+    )
+
+
 
 
 
@@ -807,6 +955,12 @@ def parse_args() -> argparse.Namespace:
         help="",
     )
     parser.add_argument(
+        "--day-workers",
+        type=int,
+        default=1,
+        help="Parallel day vectorization workers. Use >1 on large-memory CPU machines.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -847,6 +1001,9 @@ def main() -> None:
     #       Using all data gives later-day samples richer historical context.
     print("[4/7] Building user histories from ALL data (bisect_left prevents leakage) ...")
     user_histories = build_user_behavior_sequences(df)
+    print("[4/7] Preparing reusable user history arrays ...")
+    prepared_histories = prepare_user_histories(user_histories)
+    del user_histories
 
     # [5/7] Use full data (no negative sampling)
     print("[5/7] Using full data (no negative sampling)")
@@ -864,61 +1021,53 @@ def main() -> None:
     min_ts_all = float("inf")
     max_ts_all = 0
 
-    for day_idx in range(num_days):
-        day_label = f"day_{day_idx + 1}"
-        day_dir = args.output_dir / day_label
-        day_dir.mkdir(parents=True, exist_ok=True)
+    day_results: list[dict] = []
+    if args.day_workers > 1:
+        print(f"[7/7] Vectorizing days in parallel: workers={args.day_workers}")
+        unique_days_list = [int(day) for day in unique_days.tolist()]
+        with ProcessPoolExecutor(
+            max_workers=args.day_workers,
+            initializer=init_day_worker,
+            initargs=(
+                day_dfs,
+                prepared_histories,
+                str(args.output_dir),
+                unique_days_list,
+                args.seq_len,
+                args.num_sequences,
+            ),
+        ) as executor:
+            futures = [executor.submit(vectorize_day_worker, day_idx) for day_idx in range(num_days)]
+            for future in as_completed(futures):
+                day_results.append(future.result())
+                print(f"  completed days={len(day_results)}/{num_days}")
+    else:
+        for day_idx in range(num_days):
+            day_results.append(
+                vectorize_and_save_day(
+                    day_idx=day_idx,
+                    day_id=int(unique_days[day_idx]),
+                    day_label=f"day_{day_idx + 1}",
+                    day_df=day_dfs[day_idx],
+                    prepared_histories=prepared_histories,
+                    seq_len=args.seq_len,
+                    num_sequences=args.num_sequences,
+                    output_dir=args.output_dir,
+                )
+            )
 
-        print(f"[7/7] Vectorizing {day_label} ({len(day_dfs[day_idx]):,} rows) ...")
-        non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, day_meta = vectorize_dataset(
-            df=day_dfs[day_idx],
-            user_histories=user_histories,
-            seq_len=args.seq_len,
-            num_sequences=args.num_sequences,
-            max_rows=None,  # per-day, no subsampling
-        )
-
-        # Save per-day tensors
-        torch.save(non_seq_sparse, day_dir / "non_seq_sparse.pt")
-        torch.save(non_seq_dense, day_dir / "non_seq_dense.pt")
-        torch.save(seq_sparse, day_dir / "seq_sparse.pt")
-        torch.save(seq_dense, day_dir / "seq_dense.pt")
-        torch.save(seq_mask, day_dir / "seq_mask.pt")
-        torch.save(labels, day_dir / "labels.pt")
-        torch.save(timestamps, day_dir / "timestamps.pt")
-
-        n = len(labels)
-        pos = int(labels.sum().item())
-        neg = n - pos
-        click_nonempty = int(seq_mask[:, 0].any(dim=1).sum().item())
-        expose_nonempty = int(seq_mask[:, 1].any(dim=1).sum().item())
-        ts_min = int(timestamps.min().item()) if n else 0
-        ts_max = int(timestamps.max().item()) if n else 0
-
-        total_pos += pos
-        total_neg += neg
-        total_click_nonempty += click_nonempty
-        total_expose_nonempty += expose_nonempty
-        min_ts_all = min(min_ts_all, ts_min)
-        max_ts_all = max(max_ts_all, ts_max)
-
-        day_meta["day_label"] = day_label
-        day_meta["day_index"] = day_idx
-        day_meta["day_id"] = int(unique_days[day_idx])
-        day_meta["num_samples"] = n
-        day_meta["timestamp_range"] = [ts_min, ts_max]
+    day_results.sort(key=lambda item: item["day_meta"]["day_index"])
+    for result in day_results:
+        day_meta = result["day_meta"]
+        total_pos += result["pos"]
+        total_neg += result["neg"]
+        total_click_nonempty += result["click_nonempty"]
+        total_expose_nonempty += result["expose_nonempty"]
+        min_ts_all = min(min_ts_all, result["ts_min"])
+        max_ts_all = max(max_ts_all, result["ts_max"])
         day_metas.append(day_meta)
 
-        print(f"  {day_label} saved to {day_dir}")
-        print(f"    non_seq_sparse: {tuple(non_seq_sparse.shape)}")
-        print(f"    non_seq_dense:  {tuple(non_seq_dense.shape)}")
-        print(f"    seq_sparse:     {tuple(seq_sparse.shape)}")
-        print(f"    seq_dense:      {tuple(seq_dense.shape)}")
-        print(f"    seq_mask:       {tuple(seq_mask.shape)}")
-        print(f"    labels:         {tuple(labels.shape)}")
-        print(f"    timestamps:     {tuple(timestamps.shape)}")
-
-    del day_dfs, user_histories
+    del day_dfs, prepared_histories
 
     # Write global metadata
     metadata = {
