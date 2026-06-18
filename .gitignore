@@ -5,5 +5,4 @@ data/
 outputs/
 *.pyc
 *.pt
-*.parquet
 *.csv
