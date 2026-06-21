@@ -482,7 +482,7 @@ def vectorize_dataset(
     if num_sequences != SUPPORTED_NUM_SEQUENCES:
         raise ValueError(
             f" {SUPPORTED_NUM_SEQUENCES} "
-            f" num_sequences={num_sequences}。"
+            f" num_sequences={num_sequences}."
         )
 
 
@@ -518,7 +518,7 @@ def vectorize_dataset(
     hour_np = (dt_index.hour.to_numpy(dtype=np.float32) / 23.0).astype(np.float32)
     dow_np = (dt_index.dayofweek.to_numpy(dtype=np.float32) / 6.0).astype(np.float32)
 
-    # ── Vectorized non_seq_sparse ────────────────────────────────────────
+    # Vectorized non_seq_sparse.
     # Bucket-encode all non-seq sparse fields at once via numpy broadcasting.
     for col_idx, field in enumerate(NON_SEQ_SPARSE_FIELDS):
         bucket = SPARSE_FIELD_BUCKETS[field]
@@ -547,7 +547,7 @@ def vectorize_dataset(
     rows_with_hist = np.where(has_history)[0]
     hist_indices = user_history_idx[rows_with_hist]
 
-    # ── Vectorized bisect_left for click and expose timestamps ───────────
+    # Vectorized bisect_left for click and expose timestamps.
     click_cuts = np.zeros(n, dtype=np.int64)
     expose_cuts = np.zeros(n, dtype=np.int64)
     click_cuts[rows_with_hist] = np.array([
@@ -559,7 +559,7 @@ def vectorize_dataset(
         for ri, hi in zip(rows_with_hist, hist_indices)
     ], dtype=np.int64)
 
-    # ── Vectorized history summaries for non_seq_dense ───────────────────
+    # Vectorized history summaries for non_seq_dense.
     click_hist_len_log = np.zeros(n, dtype=np.float32)
     expose_hist_len_log = np.zeros(n, dtype=np.float32)
     click_last_gap_log = np.zeros(n, dtype=np.float32)
@@ -649,7 +649,7 @@ def vectorize_dataset(
     non_seq_dense_np[:, 15] = click_same_customer_log
     non_seq_dense_np[:, 16] = expose_same_customer_log
 
-    # ── Vectorized sequence branches ─────────────────────────────────────
+    # Vectorized sequence branches.
     for arr_idx, ri in enumerate(rows_with_hist):
         hi = int(hist_indices[arr_idx])
         cc = int(click_cuts[ri])
@@ -928,7 +928,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=PROJECT_ROOT / "data" / "processed",
-        help="data/processed）",
+        help="data/processed",
     )
     parser.add_argument(
         "--max-raw-rows",
@@ -979,7 +979,7 @@ def main() -> None:
     df = join_tables(raw_sample, ad_feature, user_profile)
     del raw_sample, ad_feature, user_profile
 
-    # [3/7] Per-day split — split all data into per-day DataFrames.
+    # [3/7] Per-day split - split all data into per-day DataFrames.
     #       Progressive validation will evaluate each day before training on it.
     TZ_OFFSET_SEC = 8 * 3600
     timestamps_all = df["time_stamp"].astype(np.int64).values
@@ -997,7 +997,7 @@ def main() -> None:
 
     # [4/7] Build user histories from ALL data.
     #       The bisect_left() cutoff in vectorize_dataset() ensures each sample
-    #       only sees history from before its own timestamp — no per-sample leakage.
+    #       only sees history from before its own timestamp - no per-sample leakage.
     #       Using all data gives later-day samples richer historical context.
     print("[4/7] Building user histories from ALL data (bisect_left prevents leakage) ...")
     user_histories = build_user_behavior_sequences(df)

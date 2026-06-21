@@ -185,7 +185,7 @@ def main() -> None:
     set_seed(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Read metadata ────────────────────────────────────────────────────
+    # Read metadata.
     with open(args.data_dir / "metadata.json", encoding="utf-8") as f:
         data_meta = json.load(f)
 
@@ -202,14 +202,14 @@ def main() -> None:
     for ds in day_splits:
         print(f"  {ds['day_label']}: samples={ds['num_samples']:,}")
 
-    # ── Validate model config ────────────────────────────────────────────
+    # Validate model config.
     expected_non_seq_tokens = len(data_meta["token_groups"])
     if args.num_non_seq_tokens != expected_non_seq_tokens:
         raise ValueError(
             f"num_non_seq_tokens mismatch: args={args.num_non_seq_tokens} data={expected_non_seq_tokens}"
         )
 
-    # ── Build model ──────────────────────────────────────────────────────
+    # Build model.
     model = TAACHyFormerClassifier(
         sparse_field_cardinalities={key: int(value) for key, value in data_meta["sparse_field_cardinalities"].items()},
         non_seq_sparse_fields=list(data_meta["non_seq_sparse_fields"]),
@@ -231,7 +231,7 @@ def main() -> None:
         field_embed_dim=args.field_embed_dim,
     ).to(args.device)
 
-    # ── Compute pos_weight from training days (1..N-1) ──────────────────
+    # Compute pos_weight from training days (1..N-1).
     train_pos = 0
     train_neg = 0
     for day_idx in range(num_days - 1):
@@ -251,7 +251,7 @@ def main() -> None:
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    # ── Print config ─────────────────────────────────────────────────────
+    # Print config.
     print(f"device={args.device}")
     print(f"  training_days={num_days - 1}  test_day={day_splits[-1]['day_label']}  "
           f"train_samples={train_total}  test_samples={day_splits[-1]['num_samples']}")
@@ -266,7 +266,7 @@ def main() -> None:
 
     args_payload = json_ready_args(args)
 
-    # ── Progressive validation training loop ─────────────────────────────
+    # Progressive validation training loop.
     # For each day D:
     #   1. Load day D's tensors
     #   2. Evaluate with current model (pre-training metrics)
@@ -339,7 +339,7 @@ def main() -> None:
         if not is_last_day:
             del train_loader
 
-    # ── Compute summary metrics ──────────────────────────────────────────
+    # Compute summary metrics.
     pre_train_evals = [r for r in progressive_results if r["phase"] == "pre_train_eval"]
     final_test_result = pre_train_evals[-1]  # Last day = test set
 
@@ -354,7 +354,7 @@ def main() -> None:
     )
     final_test_auc = final_test_result["auc"] if final_test_result["auc"] is not None else float("nan")
 
-    # ── Save results ─────────────────────────────────────────────────────
+    # Save results.
     final_model_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     run_meta = {

@@ -206,8 +206,8 @@ class TAACHyFormerClassifier(nn.Module):
         self.num_non_seq_tokens = len(self.semantic_token_builders)
         if num_non_seq_tokens != self.num_non_seq_tokens:
             raise ValueError(
-                f"num_non_seq_tokens={num_non_seq_tokens}"
-                f"{self.num_non_seq_tokens}"
+                f"num_non_seq_tokens={num_non_seq_tokens} does not match "
+                f"token_groups={self.num_non_seq_tokens}"
             )
 
         self.sequence_step_encoder = StructuredSequenceStepEncoder(
