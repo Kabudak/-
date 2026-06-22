@@ -1,7 +1,6 @@
 __pycache__/
 .cache/
 .venv/
-data/
 outputs/
 *.pyc
 *.pt
