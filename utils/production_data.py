@@ -12,23 +12,26 @@ import numpy as np
 import torch
 
 
-LABEL_COLUMNS = {"rel_level", "rel_score_bkt"}
-LABEL_MODES = {
-    "rel_score_present",
-    "rel_score_positive",
-    "rel_level_present",
-    "rel_level_positive",
+LABEL_COLUMN = "label_click"
+
+# Mapping from group names in selectedfeaturefinal.txt to sequence branch names
+GROUP_TO_BRANCH = {
+    "context": None,          # non-sequence fields (sparse)
+    "item": "item_seq",       # item candidate features
+    "impr": "impression_seq", # impression sequence
+    "click": "click_seq",     # click sequence
+    "buy": "buy_seq",         # buy sequence
 }
+
 SEQUENCE_BRANCH_ORDER = [
-    "search_seq",
     "click_seq",
-    "view_seq",
-    "cart_seq",
-    "buy_seq",
     "impression_seq",
-    "item_hit_seq",
+    "buy_seq",
+    "item_seq",
 ]
-SUMMARY_STATS = ("length_log", "mean", "std", "min", "max", "last")
+
+# Features that are already log-transformed and should NOT have signed_log1p applied
+ALREADY_LOGGED_FIELDS = {"log_all_impr_tg_1d"}
 
 
 @dataclass(frozen=True)
@@ -197,51 +200,6 @@ def bucket_id(value: Any, bucket_size: int) -> int:
     return abs(numeric) % bucket_size + 1
 
 
-def dense_summary(values: list[Any], stat: str) -> float:
-    numeric_values = [signed_log1p(value) for value in values]
-    if stat == "length_log":
-        return math.log1p(len(numeric_values))
-    if not numeric_values:
-        return 0.0
-
-    if stat == "mean":
-        return float(sum(numeric_values) / len(numeric_values))
-    if stat == "std":
-        mean = sum(numeric_values) / len(numeric_values)
-        variance = sum((value - mean) ** 2 for value in numeric_values) / len(numeric_values)
-        return float(math.sqrt(variance))
-    if stat == "min":
-        return float(min(numeric_values))
-    if stat == "max":
-        return float(max(numeric_values))
-    if stat == "last":
-        return float(numeric_values[-1])
-    raise ValueError(f"Unsupported summary stat: {stat}")
-
-
-def infer_column_infos(columns: dict[str, list[Any]], arrow_types: dict[str, str]) -> list[ColumnInfo]:
-    infos: list[ColumnInfo] = []
-    for name, values in columns.items():
-        flat_lens = [len(flatten_values(value)) for value in values]
-        non_null_rows = sum(value is not None for value in values)
-        non_empty_rows = sum(length > 0 for length in flat_lens)
-        max_flat_len = max(flat_lens, default=0)
-        mean_flat_len = sum(flat_lens) / max(len(flat_lens), 1)
-        scalar_like = max_flat_len <= 1
-        infos.append(
-            ColumnInfo(
-                name=name,
-                value_type=arrow_types.get(name, "unknown"),
-                non_null_rows=non_null_rows,
-                non_empty_rows=non_empty_rows,
-                max_flat_len=max_flat_len,
-                mean_flat_len=mean_flat_len,
-                scalar_like=scalar_like,
-            )
-        )
-    return infos
-
-
 def is_dense_name(name: str) -> bool:
     low = name.lower()
     dense_parts = (
@@ -291,30 +249,6 @@ def bucket_size_for_field(name: str) -> int:
     if low in {"language", "currency", "region", "timezone", "plat", "search_method"}:
         return 4_096
     return 262_144
-
-
-def sequence_branch_for_column(name: str, scalar_like: bool) -> str | None:
-    if scalar_like:
-        return None
-
-    low = name.lower()
-    if low in {"query_hash", "query_terms_hash", "query_len", "query_cat", "query_cat3", "query_cat4"}:
-        return None
-    if low.startswith("last_query") or low.startswith("sess_q2q") or low.startswith("log_query"):
-        return "search_seq"
-    if low.startswith("ups_cart") or "cart" in low:
-        return "cart_seq"
-    if low.startswith("ups_buy") or "buy" in low:
-        return "buy_seq"
-    if low.startswith("list_clk") or low.startswith("ups_clk") or low.startswith("ups_clkv2") or "_clk" in low:
-        return "click_seq"
-    if low.startswith("last_view") or low.startswith("ups_view") or "_view" in low:
-        return "view_seq"
-    if "impr" in low or low.startswith("pagesn") or low.startswith("cur_pagesn"):
-        return "impression_seq"
-    if low.startswith("i2i") or "_hit_" in low or low.endswith("_hit_val"):
-        return "item_hit_seq"
-    return None
 
 
 def token_group_for_feature(name: str) -> str:
@@ -369,79 +303,78 @@ def make_token_groups(non_seq_sparse_fields: list[str], non_seq_dense_specs: lis
     return {name: grouped[name] for name in preferred_order if grouped.get(name)}
 
 
-def select_sequence_fields(
-    sequence_fields: dict[str, list[str]],
-    column_info_by_name: dict[str, ColumnInfo],
-    max_seq_fields_per_branch: int | None,
-) -> dict[str, list[str]]:
-    if max_seq_fields_per_branch is None:
-        return sequence_fields
-
-    selected: dict[str, list[str]] = {}
-    for branch_name, fields in sequence_fields.items():
-        ranked = sorted(
-            fields,
-            key=lambda field: (
-                column_info_by_name[field].non_empty_rows,
-                column_info_by_name[field].mean_flat_len,
-                field,
-            ),
-            reverse=True,
-        )
-        selected[branch_name] = sorted(ranked[:max_seq_fields_per_branch])
-    return selected
-
-
-def infer_feature_schema(
-    columns: dict[str, list[Any]],
-    arrow_types: dict[str, str],
+def load_feature_schema(
+    feature_file: Path,
     seq_len: int,
-    label_mode: str,
     sequence_truncation: str,
-    max_seq_fields_per_branch: int | None = None,
 ) -> ProductionFeatureSchema:
-    if label_mode not in LABEL_MODES:
-        raise ValueError(f"Unsupported label_mode={label_mode}. Valid modes: {sorted(LABEL_MODES)}")
+    """Load feature schema from a manually curated feature grouping file.
+
+    The file format (selectedfeaturefinal.txt) uses section headers like
+    ``context:``, ``item:``, ``impr:``, ``click:``, ``buy:`` followed by one
+    feature name per line.  Blank lines and lines without a colon are ignored.
+    """
     if sequence_truncation not in {"head", "tail"}:
         raise ValueError("sequence_truncation must be either 'head' or 'tail'")
 
-    column_infos = infer_column_infos(columns, arrow_types)
-    info_by_name = {info.name: info for info in column_infos}
-    sequence_fields: dict[str, list[str]] = {name: [] for name in SEQUENCE_BRANCH_ORDER}
+    text = feature_file.read_text(encoding="utf-8")
+    groups: dict[str, list[str]] = {}
+    current_group: str | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.endswith(":"):
+            current_group = line[:-1].strip().lower()
+            groups.setdefault(current_group, [])
+            continue
+        if current_group is not None:
+            groups[current_group].append(line)
+
+    # Partition features into non-sequence vs. sequence branches
     non_seq_sparse_fields: list[str] = []
     non_seq_dense_specs: list[DenseFeatureSpec] = []
+    sequence_fields: dict[str, list[str]] = {}
 
-    for info in column_infos:
-        if info.name in LABEL_COLUMNS or info.non_empty_rows == 0:
-            continue
+    for group_name, features in groups.items():
+        branch_name = GROUP_TO_BRANCH.get(group_name)
+        if branch_name is None:
+            # Non-sequence group (e.g. "context")
+            for feat in features:
+                if feat == LABEL_COLUMN:
+                    continue
+                if is_dense_name(feat):
+                    non_seq_dense_specs.append(
+                        DenseFeatureSpec(name=feat, source=feat, stat="scalar")
+                    )
+                else:
+                    non_seq_sparse_fields.append(feat)
+        else:
+            # Sequence branch
+            branch_feats: list[str] = []
+            for feat in features:
+                if feat == LABEL_COLUMN:
+                    continue
+                branch_feats.append(feat)
+                # Scalar dense fields in a sequence branch still go into the
+                # sequence dense tensor (not a summary stat).
+            if branch_feats:
+                sequence_fields[branch_name] = branch_feats
 
-        branch_name = sequence_branch_for_column(info.name, info.scalar_like)
-        if branch_name is not None:
-            sequence_fields[branch_name].append(info.name)
-            for stat in SUMMARY_STATS:
-                non_seq_dense_specs.append(DenseFeatureSpec(name=f"{info.name}__{stat}", source=info.name, stat=stat))
-            continue
-
-        if info.scalar_like:
-            if is_dense_name(info.name):
-                non_seq_dense_specs.append(DenseFeatureSpec(name=info.name, source=info.name, stat="scalar"))
-            else:
-                non_seq_sparse_fields.append(info.name)
-            continue
-
-        for stat in SUMMARY_STATS:
-            non_seq_dense_specs.append(DenseFeatureSpec(name=f"{info.name}__{stat}", source=info.name, stat=stat))
-
+    # Ensure branches follow canonical order
     sequence_fields = {
-        branch_name: fields
-        for branch_name, fields in sequence_fields.items()
-        if fields
+        name: sequence_fields[name]
+        for name in SEQUENCE_BRANCH_ORDER
+        if name in sequence_fields
     }
-    sequence_fields = select_sequence_fields(sequence_fields, info_by_name, max_seq_fields_per_branch)
-    sequence_fields = {name: fields for name, fields in sequence_fields.items() if fields}
     if not sequence_fields:
-        raise ValueError("No behavior sequence fields were inferred from the parquet sample.")
+        raise ValueError(
+            f"No sequence features found in {feature_file}. "
+            f"Expected groups: {sorted(GROUP_TO_BRANCH.keys())}"
+        )
 
+    # Classify sequence fields into sparse vs. dense
     seq_sparse_fields: list[str] = []
     seq_dense_fields: list[str] = []
     for fields in sequence_fields.values():
@@ -454,11 +387,7 @@ def infer_feature_schema(
     non_seq_dense_specs = sorted(non_seq_dense_specs, key=lambda spec: spec.name)
     seq_sparse_fields = sorted(seq_sparse_fields)
     seq_dense_fields = sorted(seq_dense_fields)
-    sequence_fields = {
-        branch_name: sorted(sequence_fields[branch_name])
-        for branch_name in SEQUENCE_BRANCH_ORDER
-        if branch_name in sequence_fields
-    }
+
     token_groups = make_token_groups(
         non_seq_sparse_fields=non_seq_sparse_fields,
         non_seq_dense_specs=non_seq_dense_specs,
@@ -469,7 +398,7 @@ def infer_feature_schema(
     }
 
     return ProductionFeatureSchema(
-        label_mode=label_mode,
+        label_mode="label_click",
         seq_len=seq_len,
         sequence_truncation=sequence_truncation,
         non_seq_sparse_fields=non_seq_sparse_fields,
@@ -480,23 +409,14 @@ def infer_feature_schema(
         sequence_fields=sequence_fields,
         token_groups=token_groups,
         sparse_field_cardinalities=sparse_field_cardinalities,
-        column_infos=column_infos,
+        column_infos=[],
     )
 
 
-def label_from_columns(columns: dict[str, list[Any]], row_idx: int, label_mode: str) -> int:
-    rel_score = first_scalar(columns.get("rel_score_bkt", [None])[row_idx])
-    rel_level = first_scalar(columns.get("rel_level", [None])[row_idx])
-
-    if label_mode == "rel_score_present":
-        return int(rel_score is not None and safe_int(rel_score) >= 0)
-    if label_mode == "rel_score_positive":
-        return int(rel_score is not None and safe_int(rel_score) > 0)
-    if label_mode == "rel_level_present":
-        return int(rel_level is not None)
-    if label_mode == "rel_level_positive":
-        return int(rel_level is not None and safe_int(rel_level) > 0)
-    raise ValueError(f"Unsupported label_mode: {label_mode}")
+def label_from_columns(columns: dict[str, list[Any]], row_idx: int) -> int:
+    """Extract binary label from label_click column."""
+    raw = first_scalar(columns.get(LABEL_COLUMN, [None])[row_idx])
+    return safe_int(raw)
 
 
 def trim_values(values: list[Any], seq_len: int, sequence_truncation: str) -> list[Any]:
@@ -509,11 +429,9 @@ def trim_values(values: list[Any], seq_len: int, sequence_truncation: str) -> li
 
 def build_tensors(
     columns: dict[str, list[Any]],
-    arrow_types: dict[str, str],
+    feature_file: Path,
     seq_len: int,
-    label_mode: str = "rel_score_present",
     sequence_truncation: str = "tail",
-    max_seq_fields_per_branch: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     if not columns:
         raise ValueError("No columns were loaded from the production parquet.")
@@ -521,13 +439,10 @@ def build_tensors(
     if row_count == 0:
         raise ValueError("The production parquet sample is empty.")
 
-    schema = infer_feature_schema(
-        columns=columns,
-        arrow_types=arrow_types,
+    schema = load_feature_schema(
+        feature_file=feature_file,
         seq_len=seq_len,
-        label_mode=label_mode,
         sequence_truncation=sequence_truncation,
-        max_seq_fields_per_branch=max_seq_fields_per_branch,
     )
 
     non_seq_sparse_np = np.zeros((row_count, len(schema.non_seq_sparse_fields)), dtype=np.int32)
@@ -548,7 +463,7 @@ def build_tensors(
     seq_dense_index = {field: idx for idx, field in enumerate(schema.seq_dense_fields)}
 
     for row_idx in range(row_count):
-        labels_np[row_idx] = label_from_columns(columns, row_idx, schema.label_mode)
+        labels_np[row_idx] = label_from_columns(columns, row_idx)
 
         for field in schema.non_seq_sparse_fields:
             raw_value = first_scalar(columns[field][row_idx])
@@ -560,9 +475,12 @@ def build_tensors(
         for dense_idx, spec in enumerate(schema.non_seq_dense_specs):
             raw_value = columns[spec.source][row_idx]
             if spec.stat == "scalar":
-                non_seq_dense_np[row_idx, dense_idx] = signed_log1p(first_scalar(raw_value))
-            else:
-                non_seq_dense_np[row_idx, dense_idx] = dense_summary(flatten_values(raw_value), spec.stat)
+                scalar_val = first_scalar(raw_value)
+                # Skip log transform for fields that are already log-processed
+                if spec.source in ALREADY_LOGGED_FIELDS:
+                    non_seq_dense_np[row_idx, dense_idx] = safe_float(scalar_val)
+                else:
+                    non_seq_dense_np[row_idx, dense_idx] = signed_log1p(scalar_val)
 
         for branch_idx, branch_name in enumerate(schema.sequence_names):
             for field in schema.sequence_fields[branch_name]:
@@ -577,8 +495,13 @@ def build_tensors(
                         seq_sparse_np[row_idx, branch_idx, step_idx, field_idx] = bucket_id(value, bucket_size)
                 else:
                     field_idx = seq_dense_index[field]
-                    for step_idx, value in enumerate(values):
-                        seq_dense_np[row_idx, branch_idx, step_idx, field_idx] = signed_log1p(value)
+                    # Skip log transform for fields that are already log-processed
+                    if field in ALREADY_LOGGED_FIELDS:
+                        for step_idx, value in enumerate(values):
+                            seq_dense_np[row_idx, branch_idx, step_idx, field_idx] = safe_float(value)
+                    else:
+                        for step_idx, value in enumerate(values):
+                            seq_dense_np[row_idx, branch_idx, step_idx, field_idx] = signed_log1p(value)
 
     label_counts = Counter(labels_np.tolist())
     sequence_non_empty = {
@@ -587,8 +510,8 @@ def build_tensors(
     }
     metadata = {
         "dataset": "production_parquet",
-        "feature_version": "production_field_aware_hyformer_v1",
-        "label_mode": schema.label_mode,
+        "feature_version": "production_field_aware_hyformer_v2",
+        "label_column": LABEL_COLUMN,
         "label_mapping": {"0": 0, "1": 1},
         "num_samples": row_count,
         "positive_samples": int(label_counts.get(1, 0)),
@@ -610,22 +533,11 @@ def build_tensors(
         "seq_dense_fields": schema.seq_dense_fields,
         "sparse_field_cardinalities": schema.sparse_field_cardinalities,
         "token_groups": schema.token_groups,
-        "column_overview": [
-            {
-                "name": info.name,
-                "type": info.value_type,
-                "non_null_rows": info.non_null_rows,
-                "non_empty_rows": info.non_empty_rows,
-                "max_flat_len": info.max_flat_len,
-                "mean_flat_len": round(info.mean_flat_len, 4),
-                "scalar_like": info.scalar_like,
-            }
-            for info in schema.column_infos
-        ],
+        "already_logged_fields": sorted(ALREADY_LOGGED_FIELDS),
         "notes": {
-            "label": "Default label treats rel_score_bkt >= 0 as positive and -1/missing as negative.",
-            "sequence_grouping": "Behavior columns are grouped by production-style name prefixes instead of reconstructing histories.",
-            "query_generation": "Non-sequence semantic tokens and pooled sequence summaries are used by the model to generate branch queries.",
+            "label": f"Binary label from {LABEL_COLUMN} column.",
+            "feature_schema": f"Manually curated feature groups from {feature_file.name}.",
+            "already_logged": f"Fields in already_logged_fields skip signed_log1p to avoid double-log.",
         },
     }
 
