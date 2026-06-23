@@ -5,7 +5,7 @@
 Preprocess the 100-row production sample into tensors:
 
 ```bash
-python scripts/preprocess_production.py --input-parquet 000000_0_selected_head100.parquet --output-dir data/production_sample --seq-len 100
+python scripts/preprocess_production.py --input-parquet data/000000_0_final_head100.parquet --feature-file data/selectedfeaturefinal.txt --output-dir data/production_sample --seq-len 100 --non-seq-bag-len 64
 ```
 
 Train a small HyFormer run on the processed tensors:
@@ -14,14 +14,9 @@ Train a small HyFormer run on the processed tensors:
 python scripts/run_production.py --data-dir data/production_sample --epochs 1 --batch-size 16 --d-model 32 --ffn-hidden 64 --hyformer-layers 1 --short-seq-len 8
 ```
 
-Useful label variants:
-
-```bash
-python scripts/preprocess_production.py --label-mode rel_level_positive
-python scripts/preprocess_production.py --label-mode rel_score_present
-```
-
-`rel_score_present` is the default. It treats `rel_score_bkt >= 0` as positive and `-1` or missing as negative.
+The production pipeline now reads the binary label from `label_click`.
+The manual feature file builds two non-sequence tokens (`context_token`, `item_token`) and three sequence branches (`click_seq`, `impression_seq`, `buy_seq`).
+Non-sequence sparse array features are saved as sparse bags and mean-pooled inside the model.
 
 ## Public Taobao Ad Data
 

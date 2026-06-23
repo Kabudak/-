@@ -1,0 +1,758 @@
+{
+  "dataset": "production_parquet",
+  "feature_version": "production_field_aware_hyformer_v2",
+  "label_column": "label_click",
+  "label_mapping": {
+    "0": 0,
+    "1": 1
+  },
+  "num_samples": 2,
+  "positive_samples": 0,
+  "negative_samples": 2,
+  "pos_rate": 0.0,
+  "seq_len": 8,
+  "sequence_truncation": "tail",
+  "non_seq_bag_len": 16,
+  "num_sequences": 3,
+  "sequence_names": [
+    "click_seq",
+    "impression_seq",
+    "buy_seq"
+  ],
+  "sequence_fields": {
+    "click_seq": [
+      "ups_clkv2_1d2past_good",
+      "ups_clkv2_1d_cat_cnt",
+      "ups_clkv2_1h21d_good",
+      "ups_clkv2_1h_cat",
+      "ups_clkv2_1h_cat3",
+      "ups_clkv2_1h_good",
+      "ups_clkv2_1h_mall",
+      "ups_clkv2_3d_cnt",
+      "ups_clkv2_7d_ids",
+      "ups_clkv2_cat1_ids_l10",
+      "ups_clkv2_cat3_ids_l10",
+      "ups_clkv2_cat4_ids_l10",
+      "ups_clkv2_cat_ids_l10",
+      "ups_clkv2_cat_ids_top5",
+      "ups_clkv2_mall_ids_l10",
+      "ups_clkv2_tg",
+      "ups_impr_clk_buy_hit_m_pat"
+    ],
+    "impression_seq": [
+      "ups_imprv2_clkv2_30m_cat_cnt",
+      "ups_imprv2_30m_ids_hit",
+      "ups_imprv2_view_3d_cnt",
+      "ups_imprv2_clkv2_6h_cnt",
+      "list_cat4_impr_clk_cnt",
+      "ups_imprv2_clkv2_6h_cat1_cnt",
+      "ups_impr_hit_swing_i2i_rank_1d",
+      "last_view_imprv2_goods_cnt_x_hit_size",
+      "ups_impr_filter2_typed_view_ids_hit_size_x",
+      "img_impr_cnt_15d_dis",
+      "ups_impr_hit_swing_i2i_rank_3d",
+      "ups_impr_view_id_lst_index",
+      "log_all_impr_tg_1d",
+      "ups_imprv2_del_view_goods_ids",
+      "ups_impr_view_id_index",
+      "u2s_impr_clk_15d_lg",
+      "ups_impr_filter2_typed_view_id_tg",
+      "ups_imprv2_1d_ids_counter_ge2_top",
+      "ups_impr_view_cat_index",
+      "ups_impr_5min_sess_timediff_1d"
+    ],
+    "buy_seq": [
+      "ups_buy_cluster_prc_avg_cross",
+      "ups_buy_cat_ids_l20_x",
+      "target_cat_last_buy_tg",
+      "ups_impr_clk_buy_hit_c_pat",
+      "ups_buy_match_cat2_ids",
+      "ups_buy_cat_cur_prc_diff",
+      "ups_buy_cat_ids_x",
+      "target_cat3_last_buy_tg",
+      "ups_buy_mall_ids_l10",
+      "ups_buy_tg",
+      "ups_buy_7d_ids",
+      "ups_buy_cat2_ids_l10",
+      "ups_buy_cat3_ids_l10",
+      "ups_buy_cat4_ids_l10",
+      "ups_buy_mall_ids_top50",
+      "ups_buy_7d_cat4_ids",
+      "ups_buy_7d_statistic_dis",
+      "ups_buy_goods_ids_l10",
+      "ups_buy_prices_dis_l10",
+      "ups_buy_7d_cat_ids"
+    ]
+  },
+  "sequence_non_empty_samples": {
+    "click_seq": 1,
+    "impression_seq": 2,
+    "buy_seq": 2
+  },
+  "non_seq_sparse_fields": [
+    "bg_id",
+    "cat1_id",
+    "cat2_id",
+    "cat3_id",
+    "cat4_id",
+    "goods_id",
+    "label_is_ad",
+    "mall_id",
+    "opt_id",
+    "page_sn",
+    "plat",
+    "region",
+    "scene_id",
+    "timezone",
+    "user_id"
+  ],
+  "non_seq_sparse_bag_fields": [
+    "flip_cat1_ids",
+    "flip_goods_ids",
+    "goods_name_bigram_hash",
+    "i2cat2_hit_ups_clk_tg",
+    "i2i_hit_clk_ids",
+    "i2i_hit_clk_ids_1d",
+    "i2i_hit_clk_ids_3d",
+    "i2i_hit_view_ids",
+    "i2i_list_swingv3gmv",
+    "list_clk_cat_ids_l20_x",
+    "list_clk_goods_ids",
+    "list_clk_mall_ids"
+  ],
+  "non_seq_dense_fields": [
+    "flip_cat1_cnt",
+    "flip_cat2_cnt",
+    "flip_cat3_cnt",
+    "flip_cat4_cnt",
+    "flip_mall_cnt",
+    "goods_cos_cart_sim_max_dis",
+    "goods_cos_clk_sim_dis_cut3__pos0",
+    "goods_cos_clk_sim_dis_cut3__pos1",
+    "goods_cos_clk_sim_dis_cut3__pos2",
+    "goods_cos_clk_sim_max_dis",
+    "goods_cos_view_sim_dis_cut3__pos0",
+    "goods_cos_view_sim_dis_cut3__pos1",
+    "goods_cos_view_sim_dis_cut3__pos2",
+    "goods_cos_view_sim_max_dis",
+    "i2cat2_hit_clk_timediff__last",
+    "i2cat2_hit_clk_timediff__length_log",
+    "i2cat2_hit_clk_timediff__max",
+    "i2cat2_hit_clk_timediff__mean",
+    "i2cat2_hit_clk_timediff__min",
+    "i2cat2_hit_clk_timediff__std",
+    "i2i_hit_clk_size",
+    "i2i_hit_clk_timediff_3d__last",
+    "i2i_hit_clk_timediff_3d__length_log",
+    "i2i_hit_clk_timediff_3d__max",
+    "i2i_hit_clk_timediff_3d__mean",
+    "i2i_hit_clk_timediff_3d__min",
+    "i2i_hit_clk_timediff_3d__std",
+    "i2i_hit_clk_timediff_l10__last",
+    "i2i_hit_clk_timediff_l10__length_log",
+    "i2i_hit_clk_timediff_l10__max",
+    "i2i_hit_clk_timediff_l10__mean",
+    "i2i_hit_clk_timediff_l10__min",
+    "i2i_hit_clk_timediff_l10__std",
+    "list_clk_cat_cnt",
+    "list_mall_impr_clk_cnt",
+    "sales",
+    "u2c_ctr_30d",
+    "u2i_ctr_30d",
+    "u_clk_cnt_mix_d_kpos__pos0",
+    "u_clk_cnt_mix_d_kpos__pos1",
+    "u_clk_cnt_mix_d_kpos__pos2",
+    "ups_clk_hit_coclk_i2i_rank__last",
+    "ups_clk_hit_coclk_i2i_rank__length_log",
+    "ups_clk_hit_coclk_i2i_rank__max",
+    "ups_clk_hit_coclk_i2i_rank__mean",
+    "ups_clk_hit_coclk_i2i_rank__min",
+    "ups_clk_hit_coclk_i2i_rank__std",
+    "ups_clk_hit_i2i_rank_1d__last",
+    "ups_clk_hit_i2i_rank_1d__length_log",
+    "ups_clk_hit_i2i_rank_1d__max",
+    "ups_clk_hit_i2i_rank_1d__mean",
+    "ups_clk_hit_i2i_rank_1d__min",
+    "ups_clk_hit_i2i_rank_1d__std",
+    "ups_clk_hit_i2i_rank__last",
+    "ups_clk_hit_i2i_rank__length_log",
+    "ups_clk_hit_i2i_rank__max",
+    "ups_clk_hit_i2i_rank__mean",
+    "ups_clk_hit_i2i_rank__min",
+    "ups_clk_hit_i2i_rank__std"
+  ],
+  "non_seq_dense_sources": [
+    {
+      "name": "flip_cat1_cnt",
+      "source": "flip_cat1_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "flip_cat2_cnt",
+      "source": "flip_cat2_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "flip_cat3_cnt",
+      "source": "flip_cat3_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "flip_cat4_cnt",
+      "source": "flip_cat4_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "flip_mall_cnt",
+      "source": "flip_mall_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "goods_cos_cart_sim_max_dis",
+      "source": "goods_cos_cart_sim_max_dis",
+      "stat": "scalar"
+    },
+    {
+      "name": "goods_cos_clk_sim_dis_cut3__pos0",
+      "source": "goods_cos_clk_sim_dis_cut3",
+      "stat": "pos0"
+    },
+    {
+      "name": "goods_cos_clk_sim_dis_cut3__pos1",
+      "source": "goods_cos_clk_sim_dis_cut3",
+      "stat": "pos1"
+    },
+    {
+      "name": "goods_cos_clk_sim_dis_cut3__pos2",
+      "source": "goods_cos_clk_sim_dis_cut3",
+      "stat": "pos2"
+    },
+    {
+      "name": "goods_cos_clk_sim_max_dis",
+      "source": "goods_cos_clk_sim_max_dis",
+      "stat": "scalar"
+    },
+    {
+      "name": "goods_cos_view_sim_dis_cut3__pos0",
+      "source": "goods_cos_view_sim_dis_cut3",
+      "stat": "pos0"
+    },
+    {
+      "name": "goods_cos_view_sim_dis_cut3__pos1",
+      "source": "goods_cos_view_sim_dis_cut3",
+      "stat": "pos1"
+    },
+    {
+      "name": "goods_cos_view_sim_dis_cut3__pos2",
+      "source": "goods_cos_view_sim_dis_cut3",
+      "stat": "pos2"
+    },
+    {
+      "name": "goods_cos_view_sim_max_dis",
+      "source": "goods_cos_view_sim_max_dis",
+      "stat": "scalar"
+    },
+    {
+      "name": "i2cat2_hit_clk_timediff__last",
+      "source": "i2cat2_hit_clk_timediff",
+      "stat": "last"
+    },
+    {
+      "name": "i2cat2_hit_clk_timediff__length_log",
+      "source": "i2cat2_hit_clk_timediff",
+      "stat": "length_log"
+    },
+    {
+      "name": "i2cat2_hit_clk_timediff__max",
+      "source": "i2cat2_hit_clk_timediff",
+      "stat": "max"
+    },
+    {
+      "name": "i2cat2_hit_clk_timediff__mean",
+      "source": "i2cat2_hit_clk_timediff",
+      "stat": "mean"
+    },
+    {
+      "name": "i2cat2_hit_clk_timediff__min",
+      "source": "i2cat2_hit_clk_timediff",
+      "stat": "min"
+    },
+    {
+      "name": "i2cat2_hit_clk_timediff__std",
+      "source": "i2cat2_hit_clk_timediff",
+      "stat": "std"
+    },
+    {
+      "name": "i2i_hit_clk_size",
+      "source": "i2i_hit_clk_size",
+      "stat": "scalar"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_3d__last",
+      "source": "i2i_hit_clk_timediff_3d",
+      "stat": "last"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_3d__length_log",
+      "source": "i2i_hit_clk_timediff_3d",
+      "stat": "length_log"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_3d__max",
+      "source": "i2i_hit_clk_timediff_3d",
+      "stat": "max"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_3d__mean",
+      "source": "i2i_hit_clk_timediff_3d",
+      "stat": "mean"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_3d__min",
+      "source": "i2i_hit_clk_timediff_3d",
+      "stat": "min"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_3d__std",
+      "source": "i2i_hit_clk_timediff_3d",
+      "stat": "std"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_l10__last",
+      "source": "i2i_hit_clk_timediff_l10",
+      "stat": "last"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_l10__length_log",
+      "source": "i2i_hit_clk_timediff_l10",
+      "stat": "length_log"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_l10__max",
+      "source": "i2i_hit_clk_timediff_l10",
+      "stat": "max"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_l10__mean",
+      "source": "i2i_hit_clk_timediff_l10",
+      "stat": "mean"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_l10__min",
+      "source": "i2i_hit_clk_timediff_l10",
+      "stat": "min"
+    },
+    {
+      "name": "i2i_hit_clk_timediff_l10__std",
+      "source": "i2i_hit_clk_timediff_l10",
+      "stat": "std"
+    },
+    {
+      "name": "list_clk_cat_cnt",
+      "source": "list_clk_cat_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "list_mall_impr_clk_cnt",
+      "source": "list_mall_impr_clk_cnt",
+      "stat": "scalar"
+    },
+    {
+      "name": "sales",
+      "source": "sales",
+      "stat": "scalar"
+    },
+    {
+      "name": "u2c_ctr_30d",
+      "source": "u2c_ctr_30d",
+      "stat": "scalar"
+    },
+    {
+      "name": "u2i_ctr_30d",
+      "source": "u2i_ctr_30d",
+      "stat": "scalar"
+    },
+    {
+      "name": "u_clk_cnt_mix_d_kpos__pos0",
+      "source": "u_clk_cnt_mix_d_kpos",
+      "stat": "pos0"
+    },
+    {
+      "name": "u_clk_cnt_mix_d_kpos__pos1",
+      "source": "u_clk_cnt_mix_d_kpos",
+      "stat": "pos1"
+    },
+    {
+      "name": "u_clk_cnt_mix_d_kpos__pos2",
+      "source": "u_clk_cnt_mix_d_kpos",
+      "stat": "pos2"
+    },
+    {
+      "name": "ups_clk_hit_coclk_i2i_rank__last",
+      "source": "ups_clk_hit_coclk_i2i_rank",
+      "stat": "last"
+    },
+    {
+      "name": "ups_clk_hit_coclk_i2i_rank__length_log",
+      "source": "ups_clk_hit_coclk_i2i_rank",
+      "stat": "length_log"
+    },
+    {
+      "name": "ups_clk_hit_coclk_i2i_rank__max",
+      "source": "ups_clk_hit_coclk_i2i_rank",
+      "stat": "max"
+    },
+    {
+      "name": "ups_clk_hit_coclk_i2i_rank__mean",
+      "source": "ups_clk_hit_coclk_i2i_rank",
+      "stat": "mean"
+    },
+    {
+      "name": "ups_clk_hit_coclk_i2i_rank__min",
+      "source": "ups_clk_hit_coclk_i2i_rank",
+      "stat": "min"
+    },
+    {
+      "name": "ups_clk_hit_coclk_i2i_rank__std",
+      "source": "ups_clk_hit_coclk_i2i_rank",
+      "stat": "std"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank_1d__last",
+      "source": "ups_clk_hit_i2i_rank_1d",
+      "stat": "last"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank_1d__length_log",
+      "source": "ups_clk_hit_i2i_rank_1d",
+      "stat": "length_log"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank_1d__max",
+      "source": "ups_clk_hit_i2i_rank_1d",
+      "stat": "max"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank_1d__mean",
+      "source": "ups_clk_hit_i2i_rank_1d",
+      "stat": "mean"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank_1d__min",
+      "source": "ups_clk_hit_i2i_rank_1d",
+      "stat": "min"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank_1d__std",
+      "source": "ups_clk_hit_i2i_rank_1d",
+      "stat": "std"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank__last",
+      "source": "ups_clk_hit_i2i_rank",
+      "stat": "last"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank__length_log",
+      "source": "ups_clk_hit_i2i_rank",
+      "stat": "length_log"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank__max",
+      "source": "ups_clk_hit_i2i_rank",
+      "stat": "max"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank__mean",
+      "source": "ups_clk_hit_i2i_rank",
+      "stat": "mean"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank__min",
+      "source": "ups_clk_hit_i2i_rank",
+      "stat": "min"
+    },
+    {
+      "name": "ups_clk_hit_i2i_rank__std",
+      "source": "ups_clk_hit_i2i_rank",
+      "stat": "std"
+    }
+  ],
+  "seq_sparse_fields": [
+    "log_all_impr_tg_1d",
+    "target_cat3_last_buy_tg",
+    "target_cat_last_buy_tg",
+    "u2s_impr_clk_15d_lg",
+    "ups_buy_7d_cat4_ids",
+    "ups_buy_7d_cat_ids",
+    "ups_buy_7d_ids",
+    "ups_buy_cat2_ids_l10",
+    "ups_buy_cat3_ids_l10",
+    "ups_buy_cat4_ids_l10",
+    "ups_buy_cat_ids_l20_x",
+    "ups_buy_cat_ids_x",
+    "ups_buy_cluster_prc_avg_cross",
+    "ups_buy_goods_ids_l10",
+    "ups_buy_mall_ids_l10",
+    "ups_buy_mall_ids_top50",
+    "ups_buy_match_cat2_ids",
+    "ups_buy_tg",
+    "ups_clkv2_1d2past_good",
+    "ups_clkv2_1h21d_good",
+    "ups_clkv2_1h_cat",
+    "ups_clkv2_1h_cat3",
+    "ups_clkv2_1h_good",
+    "ups_clkv2_1h_mall",
+    "ups_clkv2_7d_ids",
+    "ups_clkv2_cat1_ids_l10",
+    "ups_clkv2_cat3_ids_l10",
+    "ups_clkv2_cat4_ids_l10",
+    "ups_clkv2_cat_ids_l10",
+    "ups_clkv2_cat_ids_top5",
+    "ups_clkv2_mall_ids_l10",
+    "ups_clkv2_tg",
+    "ups_impr_clk_buy_hit_c_pat",
+    "ups_impr_clk_buy_hit_m_pat",
+    "ups_impr_filter2_typed_view_id_tg",
+    "ups_impr_filter2_typed_view_ids_hit_size_x",
+    "ups_impr_view_id_index",
+    "ups_impr_view_id_lst_index",
+    "ups_imprv2_1d_ids_counter_ge2_top",
+    "ups_imprv2_30m_ids_hit",
+    "ups_imprv2_del_view_goods_ids"
+  ],
+  "seq_dense_fields": [
+    "img_impr_cnt_15d_dis",
+    "last_view_imprv2_goods_cnt_x_hit_size",
+    "list_cat4_impr_clk_cnt",
+    "ups_buy_7d_statistic_dis",
+    "ups_buy_cat_cur_prc_diff",
+    "ups_buy_prices_dis_l10",
+    "ups_clkv2_1d_cat_cnt",
+    "ups_clkv2_3d_cnt",
+    "ups_impr_5min_sess_timediff_1d",
+    "ups_impr_hit_swing_i2i_rank_1d",
+    "ups_impr_hit_swing_i2i_rank_3d",
+    "ups_impr_view_cat_index",
+    "ups_imprv2_clkv2_30m_cat_cnt",
+    "ups_imprv2_clkv2_6h_cat1_cnt",
+    "ups_imprv2_clkv2_6h_cnt",
+    "ups_imprv2_view_3d_cnt"
+  ],
+  "sparse_field_cardinalities": {
+    "bg_id": 65537,
+    "cat1_id": 262145,
+    "cat2_id": 262145,
+    "cat3_id": 262145,
+    "cat4_id": 262145,
+    "flip_cat1_ids": 262145,
+    "flip_goods_ids": 1048577,
+    "goods_id": 1048577,
+    "goods_name_bigram_hash": 1048577,
+    "i2cat2_hit_ups_clk_tg": 262145,
+    "i2i_hit_clk_ids": 262145,
+    "i2i_hit_clk_ids_1d": 262145,
+    "i2i_hit_clk_ids_3d": 262145,
+    "i2i_hit_view_ids": 262145,
+    "i2i_list_swingv3gmv": 262145,
+    "label_is_ad": 262145,
+    "list_clk_cat_ids_l20_x": 262145,
+    "list_clk_goods_ids": 1048577,
+    "list_clk_mall_ids": 1048577,
+    "log_all_impr_tg_1d": 262145,
+    "mall_id": 1048577,
+    "opt_id": 65537,
+    "page_sn": 65537,
+    "plat": 4097,
+    "region": 4097,
+    "scene_id": 65537,
+    "target_cat3_last_buy_tg": 262145,
+    "target_cat_last_buy_tg": 262145,
+    "timezone": 4097,
+    "u2s_impr_clk_15d_lg": 262145,
+    "ups_buy_7d_cat4_ids": 262145,
+    "ups_buy_7d_cat_ids": 262145,
+    "ups_buy_7d_ids": 262145,
+    "ups_buy_cat2_ids_l10": 262145,
+    "ups_buy_cat3_ids_l10": 262145,
+    "ups_buy_cat4_ids_l10": 262145,
+    "ups_buy_cat_ids_l20_x": 262145,
+    "ups_buy_cat_ids_x": 262145,
+    "ups_buy_cluster_prc_avg_cross": 262145,
+    "ups_buy_goods_ids_l10": 1048577,
+    "ups_buy_mall_ids_l10": 1048577,
+    "ups_buy_mall_ids_top50": 1048577,
+    "ups_buy_match_cat2_ids": 262145,
+    "ups_buy_tg": 262145,
+    "ups_clkv2_1d2past_good": 262145,
+    "ups_clkv2_1h21d_good": 262145,
+    "ups_clkv2_1h_cat": 262145,
+    "ups_clkv2_1h_cat3": 262145,
+    "ups_clkv2_1h_good": 262145,
+    "ups_clkv2_1h_mall": 1048577,
+    "ups_clkv2_7d_ids": 262145,
+    "ups_clkv2_cat1_ids_l10": 262145,
+    "ups_clkv2_cat3_ids_l10": 262145,
+    "ups_clkv2_cat4_ids_l10": 262145,
+    "ups_clkv2_cat_ids_l10": 262145,
+    "ups_clkv2_cat_ids_top5": 262145,
+    "ups_clkv2_mall_ids_l10": 1048577,
+    "ups_clkv2_tg": 262145,
+    "ups_impr_clk_buy_hit_c_pat": 262145,
+    "ups_impr_clk_buy_hit_m_pat": 262145,
+    "ups_impr_filter2_typed_view_id_tg": 262145,
+    "ups_impr_filter2_typed_view_ids_hit_size_x": 262145,
+    "ups_impr_view_id_index": 262145,
+    "ups_impr_view_id_lst_index": 262145,
+    "ups_imprv2_1d_ids_counter_ge2_top": 262145,
+    "ups_imprv2_30m_ids_hit": 262145,
+    "ups_imprv2_del_view_goods_ids": 1048577,
+    "user_id": 1048577
+  },
+  "token_groups": {
+    "context_token": [
+      "user_id",
+      "mall_id",
+      "opt_id",
+      "page_sn",
+      "plat",
+      "region",
+      "scene_id",
+      "timezone",
+      "flip_cat1_cnt",
+      "flip_cat1_ids",
+      "flip_cat2_cnt",
+      "flip_cat3_cnt",
+      "flip_cat4_cnt",
+      "flip_goods_ids",
+      "flip_mall_cnt",
+      "list_clk_cat_cnt",
+      "list_clk_cat_ids_l20_x",
+      "list_clk_goods_ids",
+      "list_clk_mall_ids",
+      "list_mall_impr_clk_cnt"
+    ],
+    "item_token": [
+      "label_is_ad",
+      "goods_id",
+      "sales",
+      "bg_id",
+      "cat1_id",
+      "cat2_id",
+      "cat3_id",
+      "cat4_id",
+      "goods_cos_cart_sim_max_dis",
+      "goods_cos_clk_sim_dis_cut3__pos0",
+      "goods_cos_clk_sim_dis_cut3__pos1",
+      "goods_cos_clk_sim_dis_cut3__pos2",
+      "goods_cos_clk_sim_max_dis",
+      "goods_cos_view_sim_dis_cut3__pos0",
+      "goods_cos_view_sim_dis_cut3__pos1",
+      "goods_cos_view_sim_dis_cut3__pos2",
+      "goods_cos_view_sim_max_dis",
+      "goods_name_bigram_hash",
+      "i2cat2_hit_clk_timediff__length_log",
+      "i2cat2_hit_clk_timediff__mean",
+      "i2cat2_hit_clk_timediff__std",
+      "i2cat2_hit_clk_timediff__min",
+      "i2cat2_hit_clk_timediff__max",
+      "i2cat2_hit_clk_timediff__last",
+      "i2cat2_hit_ups_clk_tg",
+      "i2i_hit_clk_ids",
+      "i2i_hit_clk_ids_1d",
+      "i2i_hit_clk_ids_3d",
+      "i2i_hit_clk_size",
+      "i2i_hit_clk_timediff_3d__length_log",
+      "i2i_hit_clk_timediff_3d__mean",
+      "i2i_hit_clk_timediff_3d__std",
+      "i2i_hit_clk_timediff_3d__min",
+      "i2i_hit_clk_timediff_3d__max",
+      "i2i_hit_clk_timediff_3d__last",
+      "i2i_hit_clk_timediff_l10__length_log",
+      "i2i_hit_clk_timediff_l10__mean",
+      "i2i_hit_clk_timediff_l10__std",
+      "i2i_hit_clk_timediff_l10__min",
+      "i2i_hit_clk_timediff_l10__max",
+      "i2i_hit_clk_timediff_l10__last",
+      "i2i_hit_view_ids",
+      "i2i_list_swingv3gmv",
+      "u2c_ctr_30d",
+      "u2i_ctr_30d",
+      "u_clk_cnt_mix_d_kpos__pos0",
+      "u_clk_cnt_mix_d_kpos__pos1",
+      "u_clk_cnt_mix_d_kpos__pos2",
+      "ups_clk_hit_coclk_i2i_rank__length_log",
+      "ups_clk_hit_coclk_i2i_rank__mean",
+      "ups_clk_hit_coclk_i2i_rank__std",
+      "ups_clk_hit_coclk_i2i_rank__min",
+      "ups_clk_hit_coclk_i2i_rank__max",
+      "ups_clk_hit_coclk_i2i_rank__last",
+      "ups_clk_hit_i2i_rank__length_log",
+      "ups_clk_hit_i2i_rank__mean",
+      "ups_clk_hit_i2i_rank__std",
+      "ups_clk_hit_i2i_rank__min",
+      "ups_clk_hit_i2i_rank__max",
+      "ups_clk_hit_i2i_rank__last",
+      "ups_clk_hit_i2i_rank_1d__length_log",
+      "ups_clk_hit_i2i_rank_1d__mean",
+      "ups_clk_hit_i2i_rank_1d__std",
+      "ups_clk_hit_i2i_rank_1d__min",
+      "ups_clk_hit_i2i_rank_1d__max",
+      "ups_clk_hit_i2i_rank_1d__last"
+    ]
+  },
+  "already_logged_fields": [
+    "log_all_impr_tg_1d"
+  ],
+  "non_seq_array_policies": {
+    "sparse_bag": [
+      "flip_cat1_ids",
+      "flip_goods_ids",
+      "goods_name_bigram_hash",
+      "i2cat2_hit_ups_clk_tg",
+      "i2i_hit_clk_ids",
+      "i2i_hit_clk_ids_1d",
+      "i2i_hit_clk_ids_3d",
+      "i2i_hit_view_ids",
+      "i2i_list_swingv3gmv",
+      "list_clk_cat_ids_l20_x",
+      "list_clk_goods_ids",
+      "list_clk_mall_ids"
+    ],
+    "dense_fixed": {
+      "goods_cos_clk_sim_dis_cut3": 3,
+      "goods_cos_view_sim_dis_cut3": 3,
+      "u_clk_cnt_mix_d_kpos": 3
+    },
+    "dense_summary": [
+      "i2cat2_hit_clk_timediff",
+      "i2i_hit_clk_timediff_3d",
+      "i2i_hit_clk_timediff_l10",
+      "ups_clk_hit_coclk_i2i_rank",
+      "ups_clk_hit_i2i_rank",
+      "ups_clk_hit_i2i_rank_1d"
+    ],
+    "summary_stats": [
+      "length_log",
+      "mean",
+      "std",
+      "min",
+      "max",
+      "last"
+    ]
+  },
+  "notes": {
+    "label": "Binary label from label_click column.",
+    "feature_schema": "Manually curated feature groups from selectedfeaturefinal.txt.",
+    "already_logged": "Fields in already_logged_fields skip signed_log1p to avoid double-log.",
+    "non_seq_sparse_bag": "Sparse array features are bucketized and mean-pooled inside the model."
+  },
+  "source_parquet": "data\\000000_0_final_head100.parquet",
+  "feature_file": "data\\selectedfeaturefinal.txt",
+  "preprocess_args": {
+    "max_rows": 2,
+    "seq_len": 8,
+    "non_seq_bag_len": 16,
+    "sequence_truncation": "tail"
+  }
+}

@@ -57,8 +57,10 @@ def run_epoch(
 
     grad_context = nullcontext() if is_train else torch.no_grad()
     with grad_context:
-        for non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels in loader:
+        for non_seq_sparse, non_seq_sparse_bag, non_seq_sparse_bag_mask, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels in loader:
             non_seq_sparse = non_seq_sparse.to(device).long()
+            non_seq_sparse_bag = non_seq_sparse_bag.to(device).long()
+            non_seq_sparse_bag_mask = non_seq_sparse_bag_mask.to(device)
             non_seq_dense = non_seq_dense.to(device).float()
             seq_sparse = seq_sparse.to(device).long()
             seq_dense = seq_dense.to(device).float()
@@ -74,7 +76,15 @@ def run_epoch(
                 else nullcontext()
             )
             with autocast_context:
-                logits = model(non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask).squeeze(-1)
+                logits = model(
+                    non_seq_sparse,
+                    non_seq_sparse_bag,
+                    non_seq_sparse_bag_mask,
+                    non_seq_dense,
+                    seq_sparse,
+                    seq_dense,
+                    seq_mask,
+                ).squeeze(-1)
                 loss = criterion(logits, labels)
 
             if is_train:
@@ -107,13 +117,26 @@ def load_tensor_bundle(data_dir: Path) -> tuple[TensorDataset, dict]:
     with open(data_dir / "metadata.json", encoding="utf-8") as f:
         metadata = json.load(f)
 
+    non_seq_sparse = torch.load(data_dir / "non_seq_sparse.pt", weights_only=True).long()
+    labels = torch.load(data_dir / "labels.pt", weights_only=True).long()
+    bag_path = data_dir / "non_seq_sparse_bag.pt"
+    bag_mask_path = data_dir / "non_seq_sparse_bag_mask.pt"
+    if bag_path.exists() and bag_mask_path.exists():
+        non_seq_sparse_bag = torch.load(bag_path, weights_only=True).long()
+        non_seq_sparse_bag_mask = torch.load(bag_mask_path, weights_only=True)
+    else:
+        non_seq_sparse_bag = torch.zeros(len(labels), 0, 1, dtype=torch.long)
+        non_seq_sparse_bag_mask = torch.zeros(len(labels), 0, 1, dtype=torch.bool)
+
     tensors = (
-        torch.load(data_dir / "non_seq_sparse.pt", weights_only=True).long(),
+        non_seq_sparse,
+        non_seq_sparse_bag,
+        non_seq_sparse_bag_mask,
         torch.load(data_dir / "non_seq_dense.pt", weights_only=True).float(),
         torch.load(data_dir / "seq_sparse.pt", weights_only=True).long(),
         torch.load(data_dir / "seq_dense.pt", weights_only=True).float(),
         torch.load(data_dir / "seq_mask.pt", weights_only=True),
-        torch.load(data_dir / "labels.pt", weights_only=True).long(),
+        labels,
     )
     return TensorDataset(*tensors), metadata
 
@@ -158,6 +181,7 @@ def main() -> None:
     model = TAACHyFormerClassifier(
         sparse_field_cardinalities={key: int(value) for key, value in metadata["sparse_field_cardinalities"].items()},
         non_seq_sparse_fields=list(metadata["non_seq_sparse_fields"]),
+        non_seq_sparse_bag_fields=list(metadata.get("non_seq_sparse_bag_fields", [])),
         non_seq_dense_fields=list(metadata["non_seq_dense_fields"]),
         seq_sparse_fields=list(metadata["seq_sparse_fields"]),
         seq_dense_fields=list(metadata["seq_dense_fields"]),

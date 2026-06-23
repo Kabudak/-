@@ -1,4 +1,4 @@
-pred：
+label:
 label_click
 
 context:
@@ -22,9 +22,6 @@ list_clk_cat_ids_l20_x
 list_clk_goods_ids
 list_clk_mall_ids
 list_mall_impr_clk_cnt
-
-
-
 
 item:
 label_is_ad
@@ -58,7 +55,7 @@ ups_clk_hit_coclk_i2i_rank
 ups_clk_hit_i2i_rank
 ups_clk_hit_i2i_rank_1d
 
-impr：
+impr:
 ups_imprv2_clkv2_30m_cat_cnt
 ups_imprv2_30m_ids_hit
 ups_imprv2_view_3d_cnt
@@ -98,11 +95,8 @@ ups_clkv2_cat_ids_top5
 ups_clkv2_mall_ids_l10
 ups_clkv2_tg
 ups_impr_clk_buy_hit_m_pat
-ups_impr_view_cat_index
-ups_impr_view_id_index
-ups_imprv2_clkv2_6h_cnt
 
-buy：
+buy:
 ups_buy_cluster_prc_avg_cross
 ups_buy_cat_ids_l20_x
 target_cat_last_buy_tg
@@ -115,11 +109,11 @@ ups_buy_mall_ids_l10
 ups_buy_tg
 ups_buy_7d_ids
 ups_buy_cat2_ids_l10
-ups_buy_cat3_ids_l10 
-ups_buy_cat4_ids_l10 
+ups_buy_cat3_ids_l10
+ups_buy_cat4_ids_l10
 ups_buy_mall_ids_top50
 ups_buy_7d_cat4_ids
 ups_buy_7d_statistic_dis
 ups_buy_goods_ids_l10
-ups_buy_prices_dis_l10 
+ups_buy_prices_dis_l10
 ups_buy_7d_cat_ids

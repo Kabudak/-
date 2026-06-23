@@ -89,29 +89,39 @@ def run_epoch(
 
     fwd_ctx = torch.no_grad() if not is_train else nullcontext()
     with fwd_ctx:
-      for non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels in loader:
-        non_seq_sparse = non_seq_sparse.to(device)
-        non_seq_dense = non_seq_dense.to(device)
-        seq_sparse = seq_sparse.to(device)
-        seq_dense = seq_dense.to(device)
-        seq_mask = seq_mask.to(device)
-        labels = labels.to(device).float()
+        for non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels in loader:
+            non_seq_sparse = non_seq_sparse.to(device)
+            non_seq_sparse_bag = torch.zeros(non_seq_sparse.size(0), 0, 1, dtype=torch.long, device=device)
+            non_seq_sparse_bag_mask = torch.zeros(non_seq_sparse.size(0), 0, 1, dtype=torch.bool, device=device)
+            non_seq_dense = non_seq_dense.to(device)
+            seq_sparse = seq_sparse.to(device)
+            seq_dense = seq_dense.to(device)
+            seq_mask = seq_mask.to(device)
+            labels = labels.to(device).float()
 
-        if is_train:
-            optimizer.zero_grad(set_to_none=True)
+            if is_train:
+                optimizer.zero_grad(set_to_none=True)
 
-        logits = model(non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask).squeeze(-1)
-        loss = criterion(logits, labels)
+            logits = model(
+                non_seq_sparse,
+                non_seq_sparse_bag,
+                non_seq_sparse_bag_mask,
+                non_seq_dense,
+                seq_sparse,
+                seq_dense,
+                seq_mask,
+            ).squeeze(-1)
+            loss = criterion(logits, labels)
 
-        if is_train:
-            loss.backward()
-            optimizer.step()
+            if is_train:
+                loss.backward()
+                optimizer.step()
 
-        batch_size = labels.size(0)
-        total_items += batch_size
-        total_loss += loss.item() * batch_size
-        all_logits.append(logits.detach().cpu())
-        all_labels.append(labels.detach().cpu().long())
+            batch_size = labels.size(0)
+            total_items += batch_size
+            total_loss += loss.item() * batch_size
+            all_logits.append(logits.detach().cpu())
+            all_labels.append(labels.detach().cpu().long())
 
     if total_items == 0:
         return 0.0, float("nan"), float("nan"), 0.0
@@ -213,6 +223,7 @@ def main() -> None:
     model = TAACHyFormerClassifier(
         sparse_field_cardinalities={key: int(value) for key, value in data_meta["sparse_field_cardinalities"].items()},
         non_seq_sparse_fields=list(data_meta["non_seq_sparse_fields"]),
+        non_seq_sparse_bag_fields=[],
         non_seq_dense_fields=list(data_meta["non_seq_dense_fields"]),
         seq_sparse_fields=list(data_meta["seq_sparse_fields"]),
         seq_dense_fields=list(data_meta["seq_dense_fields"]),

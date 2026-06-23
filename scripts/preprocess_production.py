@@ -19,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-parquet",
         type=Path,
-        default=PROJECT_ROOT / "000000_0_selected_head100.parquet",
+        default=PROJECT_ROOT / "data" / "000000_0_final_head100.parquet",
         help="Production parquet file to read.",
     )
     parser.add_argument(
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-rows", type=int, default=None, help="Optional row cap for quick checks.")
     parser.add_argument("--seq-len", type=int, default=100, help="Maximum length per behavior sequence.")
+    parser.add_argument("--non-seq-bag-len", type=int, default=64, help="Maximum length per non-sequence sparse bag feature.")
     parser.add_argument(
         "--sequence-truncation",
         choices=("head", "tail"),
@@ -58,10 +59,23 @@ def main() -> None:
         feature_file=args.feature_file,
         seq_len=args.seq_len,
         sequence_truncation=args.sequence_truncation,
+        non_seq_bag_len=args.non_seq_bag_len,
     )
-    non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, metadata = tensors
+    (
+        non_seq_sparse,
+        non_seq_sparse_bag,
+        non_seq_sparse_bag_mask,
+        non_seq_dense,
+        seq_sparse,
+        seq_dense,
+        seq_mask,
+        labels,
+        metadata,
+    ) = tensors
 
     torch.save(non_seq_sparse, args.output_dir / "non_seq_sparse.pt")
+    torch.save(non_seq_sparse_bag, args.output_dir / "non_seq_sparse_bag.pt")
+    torch.save(non_seq_sparse_bag_mask, args.output_dir / "non_seq_sparse_bag_mask.pt")
     torch.save(non_seq_dense, args.output_dir / "non_seq_dense.pt")
     torch.save(seq_sparse, args.output_dir / "seq_sparse.pt")
     torch.save(seq_dense, args.output_dir / "seq_dense.pt")
@@ -73,6 +87,7 @@ def main() -> None:
     metadata["preprocess_args"] = {
         "max_rows": args.max_rows,
         "seq_len": args.seq_len,
+        "non_seq_bag_len": args.non_seq_bag_len,
         "sequence_truncation": args.sequence_truncation,
     }
     (args.output_dir / "metadata.json").write_text(
@@ -84,6 +99,8 @@ def main() -> None:
     print(f"  output_dir:       {args.output_dir}")
     print(f"  labels:           {tuple(labels.shape)}  pos_rate={metadata['pos_rate']:.4f}")
     print(f"  non_seq_sparse:   {tuple(non_seq_sparse.shape)}")
+    print(f"  non_seq_bag:      {tuple(non_seq_sparse_bag.shape)}")
+    print(f"  non_seq_bag_mask: {tuple(non_seq_sparse_bag_mask.shape)}")
     print(f"  non_seq_dense:    {tuple(non_seq_dense.shape)}")
     print(f"  seq_sparse:       {tuple(seq_sparse.shape)}")
     print(f"  seq_dense:        {tuple(seq_dense.shape)}")

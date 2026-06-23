@@ -17,18 +17,21 @@ class SemanticTokenBuilder(nn.Module):
     def __init__(
         self,
         sparse_fields: list[str],
+        sparse_bag_fields: list[str],
         dense_fields: list[str],
         field_embed_dim: int,
         d_model: int,
     ) -> None:
         super().__init__()
         self.sparse_fields = sparse_fields
+        self.sparse_bag_fields = sparse_bag_fields
         self.dense_fields = dense_fields
 
-        if sparse_fields:
-            self.sparse_field_offsets = nn.Parameter(torch.zeros(len(sparse_fields), field_embed_dim))
+        sparse_input_fields = len(sparse_fields) + len(sparse_bag_fields)
+        if sparse_input_fields:
+            self.sparse_field_offsets = nn.Parameter(torch.zeros(sparse_input_fields, field_embed_dim))
             self.sparse_proj = nn.Sequential(
-                nn.Linear(len(sparse_fields) * field_embed_dim, d_model),
+                nn.Linear(sparse_input_fields * field_embed_dim, d_model),
                 nn.SiLU(),
                 nn.Linear(d_model, d_model),
             )
@@ -50,20 +53,34 @@ class SemanticTokenBuilder(nn.Module):
     def forward(
         self,
         non_seq_sparse: torch.Tensor,
+        non_seq_sparse_bag: torch.Tensor,
+        non_seq_sparse_bag_mask: torch.Tensor,
         non_seq_dense: torch.Tensor,
         sparse_embeddings: nn.ModuleDict,
         sparse_index: dict[str, int],
+        sparse_bag_index: dict[str, int],
         dense_index: dict[str, int],
     ) -> torch.Tensor:
         batch_size = non_seq_sparse.size(0)
         device = non_seq_sparse.device
         output = torch.zeros(batch_size, self.norm.normalized_shape[0], device=device, dtype=self.norm.weight.dtype)
 
+        sparse_parts = []
         if self.sparse_fields:
-            sparse_parts = [
+            sparse_parts.extend(
                 sparse_embeddings[field](non_seq_sparse[:, sparse_index[field]])
                 for field in self.sparse_fields
-            ]
+            )
+
+        if self.sparse_bag_fields:
+            for field in self.sparse_bag_fields:
+                bag_ids = non_seq_sparse_bag[:, sparse_bag_index[field], :]
+                bag_mask = non_seq_sparse_bag_mask[:, sparse_bag_index[field], :].unsqueeze(-1)
+                bag_emb = sparse_embeddings[field](bag_ids) * bag_mask.to(dtype=self.norm.weight.dtype)
+                denom = bag_mask.sum(dim=1).clamp_min(1).to(dtype=self.norm.weight.dtype)
+                sparse_parts.append(bag_emb.sum(dim=1) / denom)
+
+        if sparse_parts:
             sparse_stack = torch.stack(sparse_parts, dim=1)
             sparse_stack = sparse_stack + self.sparse_field_offsets.unsqueeze(0)
             sparse_repr = sparse_stack.flatten(start_dim=1)
@@ -155,6 +172,7 @@ class TAACHyFormerClassifier(nn.Module):
         self,
         sparse_field_cardinalities: dict[str, int],
         non_seq_sparse_fields: list[str],
+        non_seq_sparse_bag_fields: list[str],
         non_seq_dense_fields: list[str],
         seq_sparse_fields: list[str],
         seq_dense_fields: list[str],
@@ -181,6 +199,7 @@ class TAACHyFormerClassifier(nn.Module):
         self.token_groups = token_groups
 
         self.non_seq_sparse_index = {name: idx for idx, name in enumerate(non_seq_sparse_fields)}
+        self.non_seq_sparse_bag_index = {name: idx for idx, name in enumerate(non_seq_sparse_bag_fields)}
         self.non_seq_dense_index = {name: idx for idx, name in enumerate(non_seq_dense_fields)}
         self.seq_sparse_index = {name: idx for idx, name in enumerate(seq_sparse_fields)}
         self.seq_dense_index = {name: idx for idx, name in enumerate(seq_dense_fields)}
@@ -195,9 +214,11 @@ class TAACHyFormerClassifier(nn.Module):
         self.semantic_token_builders = nn.ModuleDict()
         for token_name, source_fields in token_groups.items():
             sparse_fields = [field for field in source_fields if field in self.non_seq_sparse_index]
+            sparse_bag_fields = [field for field in source_fields if field in self.non_seq_sparse_bag_index]
             dense_fields = [field for field in source_fields if field in self.non_seq_dense_index]
             self.semantic_token_builders[token_name] = SemanticTokenBuilder(
                 sparse_fields=sparse_fields,
+                sparse_bag_fields=sparse_bag_fields,
                 dense_fields=dense_fields,
                 field_embed_dim=field_embed_dim,
                 d_model=d_model,
@@ -254,14 +275,19 @@ class TAACHyFormerClassifier(nn.Module):
     def build_non_seq_tokens(
         self,
         non_seq_sparse: torch.Tensor,
+        non_seq_sparse_bag: torch.Tensor,
+        non_seq_sparse_bag_mask: torch.Tensor,
         non_seq_dense: torch.Tensor,
     ) -> torch.Tensor:
         tokens = [
             builder(
                 non_seq_sparse=non_seq_sparse,
+                non_seq_sparse_bag=non_seq_sparse_bag,
+                non_seq_sparse_bag_mask=non_seq_sparse_bag_mask,
                 non_seq_dense=non_seq_dense,
                 sparse_embeddings=self.sparse_embeddings,
                 sparse_index=self.non_seq_sparse_index,
+                sparse_bag_index=self.non_seq_sparse_bag_index,
                 dense_index=self.non_seq_dense_index,
             )
             for builder in self.semantic_token_builders.values()
@@ -324,12 +350,14 @@ class TAACHyFormerClassifier(nn.Module):
     def forward(
         self,
         non_seq_sparse: torch.Tensor,
+        non_seq_sparse_bag: torch.Tensor,
+        non_seq_sparse_bag_mask: torch.Tensor,
         non_seq_dense: torch.Tensor,
         seq_sparse: torch.Tensor,
         seq_dense: torch.Tensor,
         seq_mask: torch.Tensor,
     ) -> torch.Tensor:
-        non_seq_tokens = self.build_non_seq_tokens(non_seq_sparse, non_seq_dense)
+        non_seq_tokens = self.build_non_seq_tokens(non_seq_sparse, non_seq_sparse_bag, non_seq_sparse_bag_mask, non_seq_dense)
         sequence_tokens, sequence_masks, pooled_sequences = self.build_sequence_tokens(seq_sparse, seq_dense, seq_mask)
         query_tokens = self.build_query_tokens(non_seq_tokens, pooled_sequences)
         boosted_tokens = self.backbone(query_tokens, non_seq_tokens, sequence_tokens, sequence_masks)
