@@ -167,6 +167,163 @@ class StructuredSequenceStepEncoder(nn.Module):
         return self.norm(output)
 
 
+class DenseFieldProjector(nn.Module):
+    def __init__(self, num_fields: int, field_embed_dim: int) -> None:
+        super().__init__()
+        self.num_fields = num_fields
+        self.field_embed_dim = field_embed_dim
+        if num_fields:
+            self.weight = nn.Parameter(torch.empty(num_fields, field_embed_dim))
+            self.bias = nn.Parameter(torch.zeros(num_fields, field_embed_dim))
+            nn.init.normal_(self.weight, mean=0.0, std=0.02)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+
+    def forward(self, values: torch.Tensor, field_idx: int) -> torch.Tensor:
+        if self.weight is None or self.bias is None:
+            raise ValueError("DenseFieldProjector has no fields")
+        return values.unsqueeze(-1) * self.weight[field_idx] + self.bias[field_idx]
+
+
+class NonSequenceTokenEncoder(nn.Module):
+    def __init__(
+        self,
+        token_groups: dict[str, list[str]],
+        non_seq_sparse_index: dict[str, int],
+        non_seq_sparse_bag_index: dict[str, int],
+        non_seq_dense_index: dict[str, int],
+        field_embed_dim: int,
+        d_model: int,
+        hidden_dim: int,
+    ) -> None:
+        super().__init__()
+        self.token_groups = token_groups
+        self.non_seq_sparse_index = non_seq_sparse_index
+        self.non_seq_sparse_bag_index = non_seq_sparse_bag_index
+        self.non_seq_dense_index = non_seq_dense_index
+        self.field_embed_dim = field_embed_dim
+        self.feature_slots = max(1, max((len(fields) for fields in token_groups.values()), default=1))
+        self.dense_projector = DenseFieldProjector(len(non_seq_dense_index), field_embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.feature_slots * field_embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def _pad_and_project(self, vectors: list[torch.Tensor], batch_size: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if vectors:
+            stacked = torch.stack(vectors, dim=1)
+        else:
+            stacked = torch.zeros(batch_size, 0, self.field_embed_dim, device=device, dtype=dtype)
+        if stacked.size(1) > self.feature_slots:
+            raise ValueError("Token group has more fields than configured feature slots")
+        if stacked.size(1) < self.feature_slots:
+            pad = torch.zeros(
+                batch_size,
+                self.feature_slots - stacked.size(1),
+                self.field_embed_dim,
+                device=device,
+                dtype=dtype,
+            )
+            stacked = torch.cat([stacked, pad], dim=1)
+        return self.norm(self.mlp(stacked.flatten(start_dim=1)))
+
+    def forward(
+        self,
+        non_seq_sparse: torch.Tensor,
+        non_seq_sparse_bag: torch.Tensor,
+        non_seq_sparse_bag_mask: torch.Tensor,
+        non_seq_dense: torch.Tensor,
+        sparse_embeddings: nn.ModuleDict,
+    ) -> torch.Tensor:
+        batch_size = non_seq_sparse.size(0)
+        device = non_seq_sparse.device
+        dtype = next(iter(sparse_embeddings.values())).weight.dtype
+        tokens = []
+
+        for source_fields in self.token_groups.values():
+            vectors: list[torch.Tensor] = []
+            for field in source_fields:
+                if field in self.non_seq_sparse_index:
+                    vectors.append(sparse_embeddings[field](non_seq_sparse[:, self.non_seq_sparse_index[field]]))
+                elif field in self.non_seq_sparse_bag_index:
+                    bag_ids = non_seq_sparse_bag[:, self.non_seq_sparse_bag_index[field], :]
+                    bag_mask = non_seq_sparse_bag_mask[:, self.non_seq_sparse_bag_index[field], :].unsqueeze(-1)
+                    bag_emb = sparse_embeddings[field](bag_ids) * bag_mask.to(dtype=dtype)
+                    denom = bag_mask.sum(dim=1).clamp_min(1).to(dtype=dtype)
+                    vectors.append(bag_emb.sum(dim=1) / denom)
+                elif field in self.non_seq_dense_index:
+                    dense_idx = self.non_seq_dense_index[field]
+                    vectors.append(self.dense_projector(non_seq_dense[:, dense_idx], dense_idx))
+            tokens.append(self._pad_and_project(vectors, batch_size, device, dtype))
+
+        return torch.stack(tokens, dim=1)
+
+
+class SharedSequenceStepEncoder(nn.Module):
+    def __init__(
+        self,
+        sequence_fields: dict[str, list[str]],
+        seq_sparse_index: dict[str, int],
+        seq_dense_index: dict[str, int],
+        field_embed_dim: int,
+        d_model: int,
+        hidden_dim: int,
+    ) -> None:
+        super().__init__()
+        self.sequence_fields = sequence_fields
+        self.seq_sparse_index = seq_sparse_index
+        self.seq_dense_index = seq_dense_index
+        self.field_embed_dim = field_embed_dim
+        self.feature_slots = max(1, max((len(fields) for fields in sequence_fields.values()), default=1))
+        self.dense_projector = DenseFieldProjector(len(seq_dense_index), field_embed_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.feature_slots * field_embed_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(
+        self,
+        seq_sparse: torch.Tensor,
+        seq_dense: torch.Tensor,
+        branch_fields: list[str],
+        sparse_embeddings: nn.ModuleDict,
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = seq_sparse.shape
+        device = seq_sparse.device
+        dtype = next(iter(sparse_embeddings.values())).weight.dtype
+        vectors: list[torch.Tensor] = []
+
+        for field in branch_fields:
+            if field in self.seq_sparse_index:
+                vectors.append(sparse_embeddings[field](seq_sparse[:, :, self.seq_sparse_index[field]]))
+            elif field in self.seq_dense_index:
+                dense_idx = self.seq_dense_index[field]
+                vectors.append(self.dense_projector(seq_dense[:, :, dense_idx], dense_idx))
+
+        if vectors:
+            stacked = torch.stack(vectors, dim=2)
+        else:
+            stacked = torch.zeros(batch_size, seq_len, 0, self.field_embed_dim, device=device, dtype=dtype)
+        if stacked.size(2) > self.feature_slots:
+            raise ValueError("Sequence branch has more fields than configured feature slots")
+        if stacked.size(2) < self.feature_slots:
+            pad = torch.zeros(
+                batch_size,
+                seq_len,
+                self.feature_slots - stacked.size(2),
+                self.field_embed_dim,
+                device=device,
+                dtype=dtype,
+            )
+            stacked = torch.cat([stacked, pad], dim=2)
+        return self.norm(self.mlp(stacked.flatten(start_dim=2)))
+
+
 class TAACHyFormerClassifier(nn.Module):
     def __init__(
         self,
@@ -188,7 +345,10 @@ class TAACHyFormerClassifier(nn.Module):
         hyformer_layers: int,
         seq_encoder_type: str = "longer",
         short_seq_len: int = 8,
-        field_embed_dim: int = 24,
+        field_embed_dim: int = 64,
+        token_mlp_hidden: int = 320,
+        sequence_fields: dict[str, list[str]] | None = None,
+        sequence_names: list[str] | None = None,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -197,6 +357,13 @@ class TAACHyFormerClassifier(nn.Module):
         self.total_query_tokens = num_sequences * num_queries_per_seq
         self.d_model = d_model
         self.token_groups = token_groups
+        if sequence_fields is None:
+            shared_fields = list(seq_sparse_fields) + list(seq_dense_fields)
+            sequence_fields = {f"sequence_{idx}": shared_fields for idx in range(num_sequences)}
+        if sequence_names is None:
+            sequence_names = list(sequence_fields.keys())[:num_sequences]
+        self.sequence_fields = sequence_fields
+        self.sequence_names = sequence_names
 
         self.non_seq_sparse_index = {name: idx for idx, name in enumerate(non_seq_sparse_fields)}
         self.non_seq_sparse_bag_index = {name: idx for idx, name in enumerate(non_seq_sparse_bag_fields)}
@@ -211,31 +378,30 @@ class TAACHyFormerClassifier(nn.Module):
             }
         )
 
-        self.semantic_token_builders = nn.ModuleDict()
-        for token_name, source_fields in token_groups.items():
-            sparse_fields = [field for field in source_fields if field in self.non_seq_sparse_index]
-            sparse_bag_fields = [field for field in source_fields if field in self.non_seq_sparse_bag_index]
-            dense_fields = [field for field in source_fields if field in self.non_seq_dense_index]
-            self.semantic_token_builders[token_name] = SemanticTokenBuilder(
-                sparse_fields=sparse_fields,
-                sparse_bag_fields=sparse_bag_fields,
-                dense_fields=dense_fields,
-                field_embed_dim=field_embed_dim,
-                d_model=d_model,
-            )
+        self.non_seq_token_encoder = NonSequenceTokenEncoder(
+            token_groups=token_groups,
+            non_seq_sparse_index=self.non_seq_sparse_index,
+            non_seq_sparse_bag_index=self.non_seq_sparse_bag_index,
+            non_seq_dense_index=self.non_seq_dense_index,
+            field_embed_dim=field_embed_dim,
+            d_model=d_model,
+            hidden_dim=token_mlp_hidden,
+        )
 
-        self.num_non_seq_tokens = len(self.semantic_token_builders)
+        self.num_non_seq_tokens = len(token_groups)
         if num_non_seq_tokens != self.num_non_seq_tokens:
             raise ValueError(
                 f"num_non_seq_tokens={num_non_seq_tokens} does not match "
                 f"token_groups={self.num_non_seq_tokens}"
             )
 
-        self.sequence_step_encoder = StructuredSequenceStepEncoder(
-            sparse_fields=seq_sparse_fields,
-            dense_fields=seq_dense_fields,
+        self.sequence_step_encoder = SharedSequenceStepEncoder(
+            sequence_fields=sequence_fields,
+            seq_sparse_index=self.seq_sparse_index,
+            seq_dense_index=self.seq_dense_index,
             field_embed_dim=field_embed_dim,
             d_model=d_model,
+            hidden_dim=token_mlp_hidden,
         )
         self.sequence_position_embedding = nn.Embedding(seq_len, d_model)
         self.sequence_type_embedding = nn.Embedding(num_sequences, d_model)
@@ -279,20 +445,13 @@ class TAACHyFormerClassifier(nn.Module):
         non_seq_sparse_bag_mask: torch.Tensor,
         non_seq_dense: torch.Tensor,
     ) -> torch.Tensor:
-        tokens = [
-            builder(
-                non_seq_sparse=non_seq_sparse,
-                non_seq_sparse_bag=non_seq_sparse_bag,
-                non_seq_sparse_bag_mask=non_seq_sparse_bag_mask,
-                non_seq_dense=non_seq_dense,
-                sparse_embeddings=self.sparse_embeddings,
-                sparse_index=self.non_seq_sparse_index,
-                sparse_bag_index=self.non_seq_sparse_bag_index,
-                dense_index=self.non_seq_dense_index,
-            )
-            for builder in self.semantic_token_builders.values()
-        ]
-        return torch.stack(tokens, dim=1)
+        return self.non_seq_token_encoder(
+            non_seq_sparse=non_seq_sparse,
+            non_seq_sparse_bag=non_seq_sparse_bag,
+            non_seq_sparse_bag_mask=non_seq_sparse_bag_mask,
+            non_seq_dense=non_seq_dense,
+            sparse_embeddings=self.sparse_embeddings,
+        )
 
     def build_sequence_tokens(
         self,
@@ -305,12 +464,12 @@ class TAACHyFormerClassifier(nn.Module):
         pooled_sequences: list[torch.Tensor] = []
 
         for seq_idx in range(self.num_sequences):
+            branch_name = self.sequence_names[seq_idx]
             current_tokens = self.sequence_step_encoder(
                 seq_sparse=seq_sparse[:, seq_idx, :, :],
                 seq_dense=seq_dense[:, seq_idx, :, :],
+                branch_fields=self.sequence_fields[branch_name],
                 sparse_embeddings=self.sparse_embeddings,
-                sparse_index=self.seq_sparse_index,
-                dense_index=self.seq_dense_index,
             )
             position_ids = torch.arange(current_tokens.size(1), device=current_tokens.device)
             current_tokens = current_tokens + self.sequence_position_embedding(position_ids).unsqueeze(0)

@@ -36,16 +36,42 @@ SEQUENCE_BRANCH_ORDER = [
     "buy_seq",
 ]
 
-# Features that are already log-transformed and should NOT have signed_log1p applied
-ALREADY_LOGGED_FIELDS = {"log_all_impr_tg_1d"}
-SUMMARY_STATS = ("length_log", "mean", "std", "min", "max", "last")
+# Features that are already log-transformed and should NOT have signed_log1p applied.
+ALREADY_LOGGED_FIELDS = {"log_all_impr_tg_1d", "log_all_view_tg", "log_all_clk_tg"}
+
+FORCED_DENSE_FIELDS = {
+    "create_time",
+    "log_all_impr_tg_1d",
+    "log_all_view_tg",
+    "log_all_clk_tg",
+    "mkt_prc_div_200",
+    "price",
+    "price_div_20",
+    "price_div_50",
+    "u2i_impr_clk_30d_lg",
+    "ups_buy_tg",
+    "ups_buy_tg_v2_l10",
+    "ups_view_tg",
+    "ups_view_tg_v2_l10",
+}
+
+DEFAULT_SEQUENCE_LENS = {
+    "click_seq": 100,
+    "impression_seq": 200,
+    "buy_seq": 200,
+}
 
 NS_SPARSE_BAG_FIELDS = {
     "flip_cat1_ids",
+    "flip_mall_ids",
     "flip_goods_ids",
+    "list_clk_cat1_ids",
     "list_clk_cat_ids_l20_x",
     "list_clk_goods_ids",
     "list_clk_mall_ids",
+    "origin_query_hash",
+    "query_hash",
+    "ups_query_term_hash_v2",
     "goods_name_bigram_hash",
     "i2cat2_hit_ups_clk_tg",
     "i2i_hit_clk_ids",
@@ -53,21 +79,6 @@ NS_SPARSE_BAG_FIELDS = {
     "i2i_hit_clk_ids_3d",
     "i2i_hit_view_ids",
     "i2i_list_swingv3gmv",
-}
-
-NS_DENSE_FIXED_WIDTHS = {
-    "goods_cos_clk_sim_dis_cut3": 3,
-    "goods_cos_view_sim_dis_cut3": 3,
-    "u_clk_cnt_mix_d_kpos": 3,
-}
-
-NS_DENSE_SUMMARY_FIELDS = {
-    "i2cat2_hit_clk_timediff",
-    "i2i_hit_clk_timediff_3d",
-    "i2i_hit_clk_timediff_l10",
-    "ups_clk_hit_coclk_i2i_rank",
-    "ups_clk_hit_i2i_rank",
-    "ups_clk_hit_i2i_rank_1d",
 }
 
 
@@ -93,6 +104,7 @@ class DenseFeatureSpec:
 class ProductionFeatureSchema:
     label_mode: str
     seq_len: int
+    sequence_lens: dict[str, int]
     sequence_truncation: str
     non_seq_bag_len: int
     non_seq_sparse_fields: list[str]
@@ -102,6 +114,7 @@ class ProductionFeatureSchema:
     seq_dense_fields: list[str]
     sequence_names: list[str]
     sequence_fields: dict[str, list[str]]
+    sequence_backbone_fields: dict[str, str]
     token_groups: dict[str, list[str]]
     sparse_field_cardinalities: dict[str, int]
     column_infos: list[ColumnInfo]
@@ -239,25 +252,18 @@ def bucket_id(value: Any, bucket_size: int) -> int:
     return abs(numeric) % bucket_size + 1
 
 
-def dense_summary(values: list[Any], stat: str) -> float:
-    numeric_values = [signed_log1p(value) for value in values]
-    if stat == "length_log":
-        return math.log1p(len(numeric_values))
-    if not numeric_values:
-        return 0.0
-    if stat == "mean":
-        return float(sum(numeric_values) / len(numeric_values))
-    if stat == "std":
-        mean = sum(numeric_values) / len(numeric_values)
-        variance = sum((value - mean) ** 2 for value in numeric_values) / len(numeric_values)
-        return float(math.sqrt(variance))
-    if stat == "min":
-        return float(min(numeric_values))
-    if stat == "max":
-        return float(max(numeric_values))
-    if stat == "last":
-        return float(numeric_values[-1])
-    raise ValueError(f"Unsupported summary stat: {stat}")
+def reduced_scalar(value: Any, reduction: str) -> Any:
+    values = flatten_values(value)
+    if not values:
+        return None
+    if reduction == "first":
+        return values[0]
+    if reduction == "last":
+        return values[-1]
+    if reduction == "mean":
+        numeric_values = [safe_float(item) for item in values]
+        return sum(numeric_values) / max(len(numeric_values), 1)
+    raise ValueError(f"Unsupported scalar reduction: {reduction}")
 
 
 def trim_flat_values(value: Any, max_len: int, truncation: str) -> list[Any]:
@@ -269,18 +275,18 @@ def trim_flat_values(value: Any, max_len: int, truncation: str) -> list[Any]:
     return values[-max_len:]
 
 
-def extract_scalar_array(values: list[Any], dtype: Any = np.int64) -> np.ndarray:
+def extract_scalar_array(values: list[Any], dtype: Any = np.int64, reduction: str = "last") -> np.ndarray:
     output = np.zeros(len(values), dtype=dtype)
     for row_idx, value in enumerate(values):
         if dtype == np.float32:
-            output[row_idx] = safe_float(first_scalar(value))
+            output[row_idx] = safe_float(reduced_scalar(value, reduction))
         else:
-            output[row_idx] = safe_int(first_scalar(value))
+            output[row_idx] = safe_int(reduced_scalar(value, reduction))
     return output
 
 
-def bucket_scalar_array(values: list[Any], bucket_size: int) -> np.ndarray:
-    raw = extract_scalar_array(values, dtype=np.int64)
+def bucket_scalar_array(values: list[Any], bucket_size: int, reduction: str = "last") -> np.ndarray:
+    raw = extract_scalar_array(values, dtype=np.int64, reduction=reduction)
     return np.where(raw == 0, 0, np.abs(raw) % bucket_size + 1).astype(np.int32)
 
 
@@ -325,12 +331,12 @@ def extract_dense_matrix(
     return matrix, mask
 
 
-def extract_dense_spec_array(values: list[Any], spec: DenseFeatureSpec) -> np.ndarray:
+def extract_dense_spec_array(values: list[Any], spec: DenseFeatureSpec, array_reduction: str = "last") -> np.ndarray:
     output = np.zeros(len(values), dtype=np.float32)
     already_logged = spec.source in ALREADY_LOGGED_FIELDS
     if spec.stat == "scalar":
         for row_idx, value in enumerate(values):
-            scalar = first_scalar(value)
+            scalar = reduced_scalar(value, array_reduction)
             output[row_idx] = safe_float(scalar) if already_logged else signed_log1p(scalar)
         return output
     if spec.stat.startswith("pos"):
@@ -341,13 +347,15 @@ def extract_dense_spec_array(values: list[Any], spec: DenseFeatureSpec) -> np.nd
                 output[row_idx] = safe_float(row_values[pos_idx]) if already_logged else signed_log1p(row_values[pos_idx])
         return output
     for row_idx, value in enumerate(values):
-        raw_values = flatten_values(value)
-        output[row_idx] = dense_summary(raw_values, spec.stat)
+        scalar = reduced_scalar(value, array_reduction)
+        output[row_idx] = safe_float(scalar) if already_logged else signed_log1p(scalar)
     return output
 
 
 def is_dense_name(name: str) -> bool:
     low = name.lower()
+    if low in FORCED_DENSE_FIELDS:
+        return True
     dense_parts = (
         "cnt",
         "count",
@@ -356,6 +364,7 @@ def is_dense_name(name: str) -> bool:
         "score",
         "ctr",
         "cvr",
+        "lg",
         "sales",
         "timediff",
         "diff",
@@ -373,6 +382,8 @@ def is_dense_name(name: str) -> bool:
         "dist",
         "val",
         "ratio",
+        "price",
+        "prc",
     )
     sparse_parts = ("id", "ids", "hash")
     if any(part in low for part in sparse_parts):
@@ -463,6 +474,7 @@ def load_feature_schema(
     seq_len: int,
     sequence_truncation: str,
     non_seq_bag_len: int,
+    sequence_lens: dict[str, int] | None = None,
 ) -> ProductionFeatureSchema:
     """Load feature schema from a manually curated feature grouping file.
 
@@ -515,20 +527,6 @@ def load_feature_schema(
                 if feat in NS_SPARSE_BAG_FIELDS:
                     non_seq_sparse_bag_fields.append(feat)
                     group_fields.append(feat)
-                elif feat in NS_DENSE_FIXED_WIDTHS:
-                    for pos_idx in range(NS_DENSE_FIXED_WIDTHS[feat]):
-                        spec_name = f"{feat}__pos{pos_idx}"
-                        non_seq_dense_specs.append(
-                            DenseFeatureSpec(name=spec_name, source=feat, stat=f"pos{pos_idx}")
-                        )
-                        group_fields.append(spec_name)
-                elif feat in NS_DENSE_SUMMARY_FIELDS:
-                    for stat in SUMMARY_STATS:
-                        spec_name = f"{feat}__{stat}"
-                        non_seq_dense_specs.append(
-                            DenseFeatureSpec(name=spec_name, source=feat, stat=stat)
-                        )
-                        group_fields.append(spec_name)
                 elif is_dense_name(feat):
                     non_seq_dense_specs.append(
                         DenseFeatureSpec(name=feat, source=feat, stat="scalar")
@@ -551,17 +549,40 @@ def load_feature_schema(
             if branch_feats:
                 sequence_fields[branch_name] = branch_feats
 
-    # Ensure branches follow canonical order
+    sequence_backbone_fields = {
+        branch_name: fields[0]
+        for branch_name, fields in sequence_fields.items()
+        if fields
+    }
+
+    # Ensure branches follow canonical order.
     sequence_fields = {
         name: sequence_fields[name]
         for name in SEQUENCE_BRANCH_ORDER
         if name in sequence_fields
+    }
+    sequence_backbone_fields = {
+        name: sequence_backbone_fields[name]
+        for name in SEQUENCE_BRANCH_ORDER
+        if name in sequence_backbone_fields
     }
     if not sequence_fields:
         raise ValueError(
             f"No sequence features found in {feature_file}. "
             f"Expected groups: {sorted(GROUP_TO_BRANCH.keys())}"
         )
+
+    configured_sequence_lens = {}
+    for branch_name in sequence_fields:
+        length = seq_len
+        if sequence_lens and branch_name in sequence_lens:
+            length = sequence_lens[branch_name]
+        elif branch_name in DEFAULT_SEQUENCE_LENS:
+            length = min(seq_len, DEFAULT_SEQUENCE_LENS[branch_name])
+        if length <= 0:
+            raise ValueError(f"Sequence length for {branch_name} must be positive")
+        configured_sequence_lens[branch_name] = int(length)
+    max_seq_len = max(configured_sequence_lens.values())
 
     # Classify sequence fields into sparse vs. dense
     seq_sparse_fields: list[str] = []
@@ -591,7 +612,8 @@ def load_feature_schema(
 
     return ProductionFeatureSchema(
         label_mode="label_click",
-        seq_len=seq_len,
+        seq_len=max_seq_len,
+        sequence_lens=configured_sequence_lens,
         sequence_truncation=sequence_truncation,
         non_seq_bag_len=non_seq_bag_len,
         non_seq_sparse_fields=non_seq_sparse_fields,
@@ -601,6 +623,7 @@ def load_feature_schema(
         seq_dense_fields=seq_dense_fields,
         sequence_names=list(sequence_fields.keys()),
         sequence_fields=sequence_fields,
+        sequence_backbone_fields=sequence_backbone_fields,
         token_groups=token_groups,
         sparse_field_cardinalities=sparse_field_cardinalities,
         column_infos=[],
@@ -627,6 +650,8 @@ def build_tensors(
     seq_len: int,
     sequence_truncation: str = "tail",
     non_seq_bag_len: int = 64,
+    sequence_lens: dict[str, int] | None = None,
+    non_seq_array_reduction: str = "last",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     if not columns:
         raise ValueError("No columns were loaded from the production parquet.")
@@ -639,6 +664,7 @@ def build_tensors(
         seq_len=seq_len,
         sequence_truncation=sequence_truncation,
         non_seq_bag_len=non_seq_bag_len,
+        sequence_lens=sequence_lens,
     )
 
     non_seq_sparse_np = np.zeros((row_count, len(schema.non_seq_sparse_fields)), dtype=np.int32)
@@ -670,7 +696,7 @@ def build_tensors(
     labels_np = np.asarray([label_from_columns(columns, row_idx) for row_idx in range(row_count)], dtype=np.int64)
 
     for field, field_idx in non_seq_sparse_index.items():
-        non_seq_sparse_np[:, field_idx] = bucket_scalar_array(columns[field], bucket_size_for_field(field))
+        non_seq_sparse_np[:, field_idx] = bucket_scalar_array(columns[field], bucket_size_for_field(field), reduction="last")
 
     for field, field_idx in non_seq_sparse_bag_index.items():
         matrix, mask = extract_sparse_matrix(
@@ -683,28 +709,36 @@ def build_tensors(
         non_seq_sparse_bag_mask_np[:, field_idx, :] = mask
 
     for dense_idx, spec in enumerate(schema.non_seq_dense_specs):
-        non_seq_dense_np[:, dense_idx] = extract_dense_spec_array(columns[spec.source], spec)
+        non_seq_dense_np[:, dense_idx] = extract_dense_spec_array(
+            columns[spec.source],
+            spec,
+            array_reduction=non_seq_array_reduction,
+        )
 
     for branch_idx, branch_name in enumerate(schema.sequence_names):
+        branch_len = schema.sequence_lens[branch_name]
+        backbone_field = schema.sequence_backbone_fields[branch_name]
         for field in schema.sequence_fields[branch_name]:
             if field in seq_sparse_index:
                 matrix, mask = extract_sparse_matrix(
                     columns[field],
-                    width=seq_len,
+                    width=branch_len,
                     truncation=schema.sequence_truncation,
                     bucket_size=bucket_size_for_field(field),
                 )
-                seq_sparse_np[:, branch_idx, :, seq_sparse_index[field]] = matrix
-                seq_mask_np[:, branch_idx, :] |= mask
+                seq_sparse_np[:, branch_idx, :branch_len, seq_sparse_index[field]] = matrix
+                if field == backbone_field:
+                    seq_mask_np[:, branch_idx, :branch_len] = mask
             else:
                 matrix, mask = extract_dense_matrix(
                     columns[field],
-                    width=seq_len,
+                    width=branch_len,
                     truncation=schema.sequence_truncation,
                     already_logged=field in ALREADY_LOGGED_FIELDS,
                 )
-                seq_dense_np[:, branch_idx, :, seq_dense_index[field]] = matrix
-                seq_mask_np[:, branch_idx, :] |= mask
+                seq_dense_np[:, branch_idx, :branch_len, seq_dense_index[field]] = matrix
+                if field == backbone_field:
+                    seq_mask_np[:, branch_idx, :branch_len] = mask
 
     label_counts = Counter(labels_np.tolist())
     sequence_non_empty = {
@@ -721,11 +755,13 @@ def build_tensors(
         "negative_samples": int(label_counts.get(0, 0)),
         "pos_rate": round(int(label_counts.get(1, 0)) / max(row_count, 1), 6),
         "seq_len": schema.seq_len,
+        "sequence_lens": schema.sequence_lens,
         "sequence_truncation": schema.sequence_truncation,
         "non_seq_bag_len": schema.non_seq_bag_len,
         "num_sequences": len(schema.sequence_names),
         "sequence_names": schema.sequence_names,
         "sequence_fields": schema.sequence_fields,
+        "sequence_backbone_fields": schema.sequence_backbone_fields,
         "sequence_non_empty_samples": sequence_non_empty,
         "non_seq_sparse_fields": schema.non_seq_sparse_fields,
         "non_seq_sparse_bag_fields": schema.non_seq_sparse_bag_fields,
@@ -741,15 +777,15 @@ def build_tensors(
         "already_logged_fields": sorted(ALREADY_LOGGED_FIELDS),
         "non_seq_array_policies": {
             "sparse_bag": sorted(NS_SPARSE_BAG_FIELDS),
-            "dense_fixed": dict(sorted(NS_DENSE_FIXED_WIDTHS.items())),
-            "dense_summary": sorted(NS_DENSE_SUMMARY_FIELDS),
-            "summary_stats": list(SUMMARY_STATS),
+            "dense_array_reduction": non_seq_array_reduction,
+            "sparse_scalar_array_reduction": "last",
         },
         "notes": {
             "label": f"Binary label from {LABEL_COLUMN} column.",
             "feature_schema": f"Manually curated feature groups from {feature_file.name}.",
             "already_logged": f"Fields in already_logged_fields skip signed_log1p to avoid double-log.",
             "non_seq_sparse_bag": "Sparse array features are bucketized and mean-pooled inside the model.",
+            "sequence_mask": "Each sequence mask is built only from that branch's first selected backbone field.",
         },
     }
 

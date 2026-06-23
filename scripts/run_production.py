@@ -152,8 +152,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--pos-weight-mode", choices=("none", "auto"), default="auto")
-    parser.add_argument("--d-model", type=int, default=64)
-    parser.add_argument("--field-embed-dim", type=int, default=16)
+    parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--field-embed-dim", type=int, default=64)
+    parser.add_argument("--token-mlp-hidden", type=int, default=320)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ffn-hidden", type=int, default=128)
     parser.add_argument("--hyformer-layers", type=int, default=2)
@@ -198,6 +199,9 @@ def main() -> None:
         seq_encoder_type=args.seq_encoder_type,
         short_seq_len=args.short_seq_len,
         field_embed_dim=args.field_embed_dim,
+        token_mlp_hidden=args.token_mlp_hidden,
+        sequence_fields=dict(metadata.get("sequence_fields", {})) or None,
+        sequence_names=list(metadata.get("sequence_names", [])) or None,
     ).to(args.device)
 
     train_labels = dataset.tensors[-1][train_indices].float()
@@ -225,7 +229,7 @@ def main() -> None:
     )
     print(
         f"d_model={args.d_model} layers={args.hyformer_layers} encoder={args.seq_encoder_type} "
-        f"field_embed_dim={args.field_embed_dim}"
+        f"field_embed_dim={args.field_embed_dim} token_mlp_hidden={args.token_mlp_hidden}"
     )
     if pos_weight is not None:
         print(f"train_pos={train_pos} train_neg={train_neg} pos_weight={pos_weight.item():.4f}")

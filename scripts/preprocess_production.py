@@ -14,12 +14,27 @@ if str(PROJECT_ROOT) not in sys.path:
 from utils.production_data import build_tensors, load_parquet_columns
 
 
+def parse_sequence_lens(raw_value: str | None) -> dict[str, int] | None:
+    if raw_value is None or not raw_value.strip():
+        return None
+    result: dict[str, int] = {}
+    for part in raw_value.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid sequence length item: {item}")
+        name, value = item.split("=", 1)
+        result[name.strip()] = int(value.strip())
+    return result
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vectorize production parquet features for HyFormer")
     parser.add_argument(
         "--input-parquet",
         type=Path,
-        default=PROJECT_ROOT / "data" / "000000_0_final_head100.parquet",
+        default=PROJECT_ROOT / "data" / "000000_0.gz_head100.parquet",
         help="Production parquet file to read.",
     )
     parser.add_argument(
@@ -36,7 +51,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-rows", type=int, default=None, help="Optional row cap for quick checks.")
     parser.add_argument("--seq-len", type=int, default=100, help="Maximum length per behavior sequence.")
+    parser.add_argument(
+        "--sequence-lens",
+        default=None,
+        help="Optional comma-separated per-branch lengths, for example click_seq=100,impression_seq=10,buy_seq=10.",
+    )
     parser.add_argument("--non-seq-bag-len", type=int, default=64, help="Maximum length per non-sequence sparse bag feature.")
+    parser.add_argument(
+        "--non-seq-array-reduction",
+        choices=("last", "mean"),
+        default="last",
+        help="How dense non-sequence array features are reduced into one scalar feature.",
+    )
     parser.add_argument(
         "--sequence-truncation",
         choices=("head", "tail"),
@@ -54,12 +80,15 @@ def main() -> None:
     columns, arrow_types = load_parquet_columns(args.input_parquet, max_rows=args.max_rows)
 
     print(f"[data] feature schema: {args.feature_file}")
+    sequence_lens = parse_sequence_lens(args.sequence_lens)
     tensors = build_tensors(
         columns=columns,
         feature_file=args.feature_file,
         seq_len=args.seq_len,
         sequence_truncation=args.sequence_truncation,
         non_seq_bag_len=args.non_seq_bag_len,
+        sequence_lens=sequence_lens,
+        non_seq_array_reduction=args.non_seq_array_reduction,
     )
     (
         non_seq_sparse,
@@ -87,7 +116,9 @@ def main() -> None:
     metadata["preprocess_args"] = {
         "max_rows": args.max_rows,
         "seq_len": args.seq_len,
+        "sequence_lens": sequence_lens,
         "non_seq_bag_len": args.non_seq_bag_len,
+        "non_seq_array_reduction": args.non_seq_array_reduction,
         "sequence_truncation": args.sequence_truncation,
     }
     (args.output_dir / "metadata.json").write_text(
@@ -106,6 +137,8 @@ def main() -> None:
     print(f"  seq_dense:        {tuple(seq_dense.shape)}")
     print(f"  seq_mask:         {tuple(seq_mask.shape)}")
     print(f"  sequence_names:   {metadata['sequence_names']}")
+    print(f"  sequence_lens:    {metadata['sequence_lens']}")
+    print(f"  sequence_backbone:{metadata['sequence_backbone_fields']}")
     print(f"  token_groups:     {list(metadata['token_groups'].keys())}")
 
 
