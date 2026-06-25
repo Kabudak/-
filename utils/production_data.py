@@ -189,7 +189,7 @@ def sequence_values(value: Any) -> list[Any]:
 def first_scalar(value: Any) -> Any:
     if value is None:
         return None
-    while isinstance(value, (list, tuple)):
+    while isinstance(value, (list, tuple, np.ndarray)):
         if not value:
             return None
         value = value[0]
