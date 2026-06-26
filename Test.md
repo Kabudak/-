@@ -21,6 +21,17 @@ Non-sequence dense arrays are reduced into one scalar feature instead of being e
 Non-sequence sparse array features are saved as sparse bags and mean-pooled inside the model.
 Feature vectors are embedded to `field_embed_dim` first, concatenated inside each group, and projected to `d_model` by a shared MLP.
 
+## Production HDFS Streaming
+
+Run progressive streaming training from HDFS:
+
+```bash
+python scripts/run_production_hdfs.py --data-path hdfs://namenode:8020/path/to/day --feature-file data/selectedfeaturefinal.txt --parquet-batch-size 4096 --seq-len 200 --sequence-lens click_seq=100,impression_seq=200,buy_seq=200 --non-seq-bag-len 64 --non-seq-array-reduction last --amp --num-workers 2 --pin-memory --prefetch-factor 2 --debug-batches 5 --eval-every-batches 20 --train-metrics-every 20 --save-checkpoint
+```
+
+Use `--debug-batches` on the first platform run to verify label positive rate, sparse non-zero rate, sequence mask length, dense value scale, and logits scale.
+Use `--eval-every-batches 1 --train-metrics-every 1` only when every-batch metrics are needed, because every AUC/logloss computation copies tensors back to CPU.
+
 ## Public Taobao Ad Data
 
 Preprocess the public CSV data:

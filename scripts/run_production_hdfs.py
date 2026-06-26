@@ -2,7 +2,7 @@
 
 Uses ``ProductionHDFSDataset`` to read parquet files from HDFS (or local),
 preprocess each batch with production_data logic, and yield 8-tuple tensors
-directly — no offline preprocessing step required.
+directly - no offline preprocessing step required.
 
 Progressive per-batch training:
   - First batch:  train only (no validation)
@@ -54,18 +54,76 @@ def compute_metrics(scores: torch.Tensor, labels: torch.Tensor) -> dict:
     return {"auc": auc, "log_loss": ll, "accuracy": acc}
 
 
-def move_batch_to_device(batch: tuple, device: str):
+def empty_metrics() -> dict:
+    return {"auc": float("nan"), "log_loss": float("nan"), "accuracy": float("nan")}
+
+
+def maybe_compute_metrics(logits: torch.Tensor, labels: torch.Tensor, enabled: bool) -> dict:
+    if not enabled:
+        return empty_metrics()
+    scores = torch.sigmoid(logits.detach()).cpu()
+    labels_cpu = labels.detach().cpu().long()
+    return compute_metrics(scores, labels_cpu)
+
+
+def rounded_metric(value: float) -> float | None:
+    return round(value, 6) if not math.isnan(value) else None
+
+
+def format_metric(value: float) -> str:
+    return f"{value:.4f}" if not math.isnan(value) else "nan"
+
+
+def should_run_every(batch_index: int, interval: int) -> bool:
+    return interval > 0 and batch_index % interval == 0
+
+
+def tensor_nonzero_rate(tensor: torch.Tensor) -> float:
+    if tensor.numel() == 0:
+        return 0.0
+    return float((tensor != 0).float().mean().item())
+
+
+def print_batch_debug(batch_index: int, batch_tensors: tuple, logits: torch.Tensor | None = None) -> None:
+    non_seq_sparse, non_seq_sparse_bag, non_seq_sparse_bag_mask, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels = batch_tensors
+    labels_float = labels.detach().float()
+    pos_rate = float(labels_float.mean().item()) if labels_float.numel() else 0.0
+    label_unique = sorted(labels.detach().cpu().long().unique().tolist())
+    seq_mask_counts = seq_mask.detach().float().sum(dim=2).mean(dim=0).cpu().tolist()
+    dense_finite = bool(torch.isfinite(non_seq_dense).all().item()) and bool(torch.isfinite(seq_dense).all().item())
+
+    message = (
+        f"[DEBUG Batch {batch_index:03d}] "
+        f"pos_rate={pos_rate:.6f} labels={label_unique} "
+        f"ns_sparse_nz={tensor_nonzero_rate(non_seq_sparse):.4f} "
+        f"ns_bag_mask={tensor_nonzero_rate(non_seq_sparse_bag_mask):.4f} "
+        f"ns_dense_abs_mean={float(non_seq_dense.detach().abs().mean().item()) if non_seq_dense.numel() else 0.0:.4f} "
+        f"seq_sparse_nz={tensor_nonzero_rate(seq_sparse):.4f} "
+        f"seq_dense_abs_mean={float(seq_dense.detach().abs().mean().item()) if seq_dense.numel() else 0.0:.4f} "
+        f"seq_mask_mean={seq_mask_counts} "
+        f"dense_finite={dense_finite}"
+    )
+    if logits is not None:
+        detached_logits = logits.detach()
+        message += (
+            f" logits_mean={float(detached_logits.mean().item()):.4f} "
+            f"logits_std={float(detached_logits.std(unbiased=False).item()):.4f}"
+        )
+    print(message)
+
+
+def move_batch_to_device(batch: tuple, device: str, non_blocking: bool = False):
     """Move a batch of tensors to device, return unpacked tensors."""
     non_seq_sparse, non_seq_sparse_bag, non_seq_sparse_bag_mask, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels = batch
     return (
-        non_seq_sparse.to(device).long(),
-        non_seq_sparse_bag.to(device).long(),
-        non_seq_sparse_bag_mask.to(device),
-        non_seq_dense.to(device).float(),
-        seq_sparse.to(device).long(),
-        seq_dense.to(device).float(),
-        seq_mask.to(device),
-        labels.to(device).float(),
+        non_seq_sparse.to(device, non_blocking=non_blocking).long(),
+        non_seq_sparse_bag.to(device, non_blocking=non_blocking).long(),
+        non_seq_sparse_bag_mask.to(device, non_blocking=non_blocking),
+        non_seq_dense.to(device, non_blocking=non_blocking).float(),
+        seq_sparse.to(device, non_blocking=non_blocking).long(),
+        seq_dense.to(device, non_blocking=non_blocking).float(),
+        seq_mask.to(device, non_blocking=non_blocking),
+        labels.to(device, non_blocking=non_blocking).float(),
     )
 
 
@@ -133,10 +191,17 @@ def parse_args() -> argparse.Namespace:
 
     # ---- Preprocessing ----
     parser.add_argument("--parquet-batch-size", type=int, default=4096, help="Rows per iter_batches call.")
-    parser.add_argument("--seq-len", type=int, default=100, help="Max sequence length.")
+    parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker count for streaming preprocessing.")
+    parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when num_workers > 0.")
+    parser.add_argument("--pin-memory", action="store_true", help="Use pinned host memory for faster CUDA transfers.")
+    parser.add_argument("--seq-len", type=int, default=200, help="Global max sequence length.")
     parser.add_argument("--sequence-truncation", choices=("head", "tail"), default="tail")
     parser.add_argument("--non-seq-bag-len", type=int, default=64, help="Max length per non-seq sparse bag feature.")
-    parser.add_argument("--sequence-lens", default=None, help="Per-branch lengths, e.g. click_seq=100,impression_seq=200,buy_seq=200")
+    parser.add_argument(
+        "--sequence-lens",
+        default="click_seq=100,impression_seq=200,buy_seq=200",
+        help="Per-branch lengths, e.g. click_seq=100,impression_seq=200,buy_seq=200",
+    )
     parser.add_argument("--non-seq-array-reduction", choices=("last", "mean"), default="last")
     parser.add_argument("--sample-rate", type=float, default=0, help="Fraction of files to use (0=all).")
 
@@ -150,6 +215,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp", action="store_true", help="Enable CUDA autocast and GradScaler.")
     parser.add_argument("--save-checkpoint", action="store_true")
+    parser.add_argument("--debug-batches", type=int, default=0, help="Print data health diagnostics for the first N batches.")
+    parser.add_argument("--eval-every-batches", type=int, default=20, help="Run pre-train eval every N batches. Use 1 for every batch.")
+    parser.add_argument("--train-metrics-every", type=int, default=20, help="Compute train AUC/logloss every N batches. Use 1 for every batch.")
 
     # ---- Model ----
     parser.add_argument("--d-model", type=int, default=128)
@@ -188,7 +256,7 @@ def main() -> None:
 
     sequence_lens = parse_sequence_lens(args.sequence_lens)
 
-    # ---- Build data paths: --data-path flag groups → List[List[str]] ----
+    # ---- Build data paths: --data-path flag groups -> List[List[str]] ----
     data_path: list[list[str]] = args.data_path
     if not data_path:
         print("Error: at least one --data-path is required.", file=sys.stderr)
@@ -210,8 +278,16 @@ def main() -> None:
         seed=args.seed,
     )
 
-    # IterableDataset: batch_size=None (dataset controls batching), num_workers=0
-    loader = DataLoader(dataset, batch_size=None, num_workers=0)
+    loader_kwargs = {
+        "batch_size": None,
+        "num_workers": args.num_workers,
+        "pin_memory": args.pin_memory and args.device.startswith("cuda"),
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        loader_kwargs["persistent_workers"] = True
+    loader = DataLoader(dataset, **loader_kwargs)
+    non_blocking_transfer = bool(loader_kwargs["pin_memory"])
 
     # ---- Build model from metadata ----
     metadata = dataset.get_metadata()
@@ -250,11 +326,15 @@ def main() -> None:
 
     # ---- Print config ----
     print(f"device={args.device} amp={amp_enabled}")
-    print(f"from_hdfs={args.from_hdfs} parquet_batch_size={args.parquet_batch_size}")
+    print(
+        f"from_hdfs={args.from_hdfs} parquet_batch_size={args.parquet_batch_size} "
+        f"num_workers={args.num_workers} pin_memory={loader_kwargs['pin_memory']}"
+    )
     print(
         f"sequences={metadata['sequence_names']} non_seq_tokens={len(metadata['token_groups'])} "
         f"queries_per_seq={args.num_queries_per_seq}"
     )
+    print(f"seq_len={metadata['seq_len']} sequence_lens={metadata.get('sequence_lens')}")
     print(
         f"d_model={args.d_model} layers={args.hyformer_layers} encoder={args.seq_encoder_type} "
         f"field_embed_dim={args.field_embed_dim} token_mlp_hidden={args.token_mlp_hidden}"
@@ -263,7 +343,10 @@ def main() -> None:
         print(f"pos_weight={pos_weight.item():.4f}")
     else:
         print("pos_weight=None (no class weighting)")
-    print("training_mode=progressive_per_batch")
+    print(
+        "training_mode=progressive_per_batch "
+        f"eval_every_batches={args.eval_every_batches} train_metrics_every={args.train_metrics_every}"
+    )
 
     # ---- Progressive training loop ----
     best_test_auc = float("-inf")
@@ -281,7 +364,7 @@ def main() -> None:
             print(f"[Epoch {epoch}] No data available, skipping.")
             break
 
-        batch_tensors = move_batch_to_device(first_raw, args.device)
+        batch_tensors = move_batch_to_device(first_raw, args.device, non_blocking=non_blocking_transfer)
         batch_n = batch_tensors[-1].size(0)
 
         model.train()
@@ -296,24 +379,24 @@ def main() -> None:
             train_loss.backward()
             optimizer.step()
             
-        train_scores = torch.sigmoid(train_logits.detach()).cpu()
-        train_labels_cpu = batch_tensors[-1].detach().cpu().long()
-        train_m = compute_metrics(train_scores, train_labels_cpu)
+        train_m = maybe_compute_metrics(train_logits, batch_tensors[-1], enabled=True)
+        if args.debug_batches > 0:
+            print_batch_debug(0, batch_tensors, train_logits)
 
         epoch_results.append({
             "epoch": epoch,
             "batch_index": 0,
             "phase": "train",
             "loss": round(float(train_loss.item()), 6),
-            "auc": round(train_m["auc"], 6) if not math.isnan(train_m["auc"]) else None,
-            "log_loss": round(train_m["log_loss"], 6) if not math.isnan(train_m["log_loss"]) else None,
-            "accuracy": round(train_m["accuracy"], 6),
+            "auc": rounded_metric(train_m["auc"]),
+            "log_loss": rounded_metric(train_m["log_loss"]),
+            "accuracy": rounded_metric(train_m["accuracy"]),
             "num_samples": batch_n,
         })
         print(
             f"[Epoch {epoch} Batch 000] TRAIN  "
-            f"auc={train_m['auc']:.4f}  loss={float(train_loss.item()):.4f}  "
-            f"logloss={train_m['log_loss']:.4f}  acc={train_m['accuracy']:.4f}  n={batch_n}"
+            f"auc={format_metric(train_m['auc'])}  loss={float(train_loss.item()):.4f}  "
+            f"logloss={format_metric(train_m['log_loss'])}  acc={format_metric(train_m['accuracy'])}  n={batch_n}"
         )
 
         del batch_tensors, first_raw
@@ -322,42 +405,45 @@ def main() -> None:
         # Middle + last batches: use look-ahead buffer
         #
         # We buffer one batch ahead. When we see a new batch, the buffered
-        # one is guaranteed NOT to be the last → eval + train.
-        # After the loop, the remaining buffered batch IS the last → eval only.
+        # one is guaranteed NOT to be the last -> eval + train.
+        # After the loop, the remaining buffered batch IS the last -> eval only.
         # ================================================================
         buffered_raw = None
         buffered_idx = None
 
         for idx, current_raw in enumerate(loader_iter, start=1):
             if buffered_raw is not None:
-                # buffered_raw is NOT the last batch → eval + train
-                batch_tensors = move_batch_to_device(buffered_raw, args.device)
+                # buffered_raw is NOT the last batch -> eval + train
+                batch_tensors = move_batch_to_device(buffered_raw, args.device, non_blocking=non_blocking_transfer)
                 batch_n = batch_tensors[-1].size(0)
 
-                # --- Evaluate on buffered batch ---
-                model.eval()
-                with torch.no_grad():
-                    eval_loss, eval_logits = forward_pass(model, batch_tensors, criterion, args.device, amp_enabled)
+                run_eval = should_run_every(buffered_idx, args.eval_every_batches)
+                if run_eval:
+                    # --- Evaluate on buffered batch ---
+                    model.eval()
+                    with torch.no_grad():
+                        eval_loss, eval_logits = forward_pass(model, batch_tensors, criterion, args.device, amp_enabled)
 
-                eval_scores = torch.sigmoid(eval_logits).cpu()
-                eval_labels = batch_tensors[-1].detach().cpu().long()
-                eval_m = compute_metrics(eval_scores, eval_labels)
+                    eval_m = maybe_compute_metrics(eval_logits, batch_tensors[-1], enabled=True)
+                    if args.debug_batches > 0 and buffered_idx < args.debug_batches:
+                        print_batch_debug(buffered_idx, batch_tensors, eval_logits)
 
-                epoch_results.append({
-                    "epoch": epoch,
-                    "batch_index": buffered_idx,
-                    "phase": "pre_train_eval",
-                    "loss": round(float(eval_loss.item()), 6),
-                    "auc": round(eval_m["auc"], 6) if not math.isnan(eval_m["auc"]) else None,
-                    "log_loss": round(eval_m["log_loss"], 6) if not math.isnan(eval_m["log_loss"]) else None,
-                    "accuracy": round(eval_m["accuracy"], 6),
-                    "num_samples": batch_n,
-                })
-                print(
-                    f"[Epoch {epoch} Batch {buffered_idx:03d}] EVAL   "
-                    f"auc={eval_m['auc']:.4f}  loss={float(eval_loss.item()):.4f}  "
-                    f"logloss={eval_m['log_loss']:.4f}  acc={eval_m['accuracy']:.4f}  n={batch_n}"
-                )
+                    epoch_results.append({
+                        "epoch": epoch,
+                        "batch_index": buffered_idx,
+                        "phase": "pre_train_eval",
+                        "loss": round(float(eval_loss.item()), 6),
+                        "auc": rounded_metric(eval_m["auc"]),
+                        "log_loss": rounded_metric(eval_m["log_loss"]),
+                        "accuracy": rounded_metric(eval_m["accuracy"]),
+                        "num_samples": batch_n,
+                    })
+                    print(
+                        f"[Epoch {epoch} Batch {buffered_idx:03d}] EVAL   "
+                        f"auc={format_metric(eval_m['auc'])}  loss={float(eval_loss.item()):.4f}  "
+                        f"logloss={format_metric(eval_m['log_loss'])}  "
+                        f"acc={format_metric(eval_m['accuracy'])}  n={batch_n}"
+                    )
 
                 # --- Train on buffered batch ---
                 model.train()
@@ -372,25 +458,28 @@ def main() -> None:
                     train_loss.backward()
                     optimizer.step()
 
-                train_scores = torch.sigmoid(train_logits.detach()).cpu()
-                train_labels_cpu = batch_tensors[-1].detach().cpu().long()
-                train_m = compute_metrics(train_scores, train_labels_cpu)
+                run_train_metrics = should_run_every(buffered_idx, args.train_metrics_every)
+                train_m = maybe_compute_metrics(train_logits, batch_tensors[-1], enabled=run_train_metrics)
+                if args.debug_batches > 0 and buffered_idx < args.debug_batches and not run_eval:
+                    print_batch_debug(buffered_idx, batch_tensors, train_logits)
 
                 epoch_results.append({
                     "epoch": epoch,
                     "batch_index": buffered_idx,
                     "phase": "train",
                     "loss": round(float(train_loss.item()), 6),
-                    "auc": round(train_m["auc"], 6) if not math.isnan(train_m["auc"]) else None,
-                    "log_loss": round(train_m["log_loss"], 6) if not math.isnan(train_m["log_loss"]) else None,
-                    "accuracy": round(train_m["accuracy"], 6),
+                    "auc": rounded_metric(train_m["auc"]),
+                    "log_loss": rounded_metric(train_m["log_loss"]),
+                    "accuracy": rounded_metric(train_m["accuracy"]),
                     "num_samples": batch_n,
                 })
-                print(
-                    f"[Epoch {epoch} Batch {buffered_idx:03d}] TRAIN  "
-                    f"auc={train_m['auc']:.4f}  loss={float(train_loss.item()):.4f}  "
-                    f"logloss={train_m['log_loss']:.4f}  acc={train_m['accuracy']:.4f}"
-                )
+                if run_train_metrics:
+                    print(
+                        f"[Epoch {epoch} Batch {buffered_idx:03d}] TRAIN  "
+                        f"auc={format_metric(train_m['auc'])}  loss={float(train_loss.item()):.4f}  "
+                        f"logloss={format_metric(train_m['log_loss'])}  "
+                        f"acc={format_metric(train_m['accuracy'])}"
+                    )
 
                 del batch_tensors
 
@@ -402,31 +491,32 @@ def main() -> None:
         # Last batch (buffered_raw): eval only, no training
         # ================================================================
         if buffered_raw is not None:
-            batch_tensors = move_batch_to_device(buffered_raw, args.device)
+            batch_tensors = move_batch_to_device(buffered_raw, args.device, non_blocking=non_blocking_transfer)
             batch_n = batch_tensors[-1].size(0)
 
             model.eval()
             with torch.no_grad():
                 eval_loss, eval_logits = forward_pass(model, batch_tensors, criterion, args.device, amp_enabled)
 
-            eval_scores = torch.sigmoid(eval_logits).cpu()
-            eval_labels = batch_tensors[-1].detach().cpu().long()
-            eval_m = compute_metrics(eval_scores, eval_labels)
+            eval_m = maybe_compute_metrics(eval_logits, batch_tensors[-1], enabled=True)
+            if args.debug_batches > 0 and buffered_idx < args.debug_batches:
+                print_batch_debug(buffered_idx, batch_tensors, eval_logits)
 
             epoch_results.append({
                 "epoch": epoch,
                 "batch_index": buffered_idx,
                 "phase": "test",
                 "loss": round(float(eval_loss.item()), 6),
-                "auc": round(eval_m["auc"], 6) if not math.isnan(eval_m["auc"]) else None,
-                "log_loss": round(eval_m["log_loss"], 6) if not math.isnan(eval_m["log_loss"]) else None,
-                "accuracy": round(eval_m["accuracy"], 6),
+                "auc": rounded_metric(eval_m["auc"]),
+                "log_loss": rounded_metric(eval_m["log_loss"]),
+                "accuracy": rounded_metric(eval_m["accuracy"]),
                 "num_samples": batch_n,
             })
             print(
                 f"[Epoch {epoch} Batch {buffered_idx:03d}] TEST   "
-                f"auc={eval_m['auc']:.4f}  loss={float(eval_loss.item()):.4f}  "
-                f"logloss={eval_m['log_loss']:.4f}  acc={eval_m['accuracy']:.4f}  n={batch_n}"
+                f"auc={format_metric(eval_m['auc'])}  loss={float(eval_loss.item()):.4f}  "
+                f"logloss={format_metric(eval_m['log_loss'])}  "
+                f"acc={format_metric(eval_m['accuracy'])}  n={batch_n}"
             )
             print(f"[Epoch {epoch} Batch {buffered_idx:03d}] TEST-ONLY (no training)")
 

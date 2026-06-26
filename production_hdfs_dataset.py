@@ -1,4 +1,4 @@
-"""Production HDFSDataset — stream parquet from HDFS with production preprocessing.
+"""Production HDFSDataset - stream parquet from HDFS with production preprocessing.
 
 Reads parquet files (local or HDFS) and preprocesses each batch using the same
 logic as ``utils/production_data.build_tensors()``, yielding the 8-tuple tensor
@@ -6,11 +6,11 @@ format that ``TAACHyFormerClassifier.forward()`` expects.
 
 Feature selection is driven by ``selectedfeaturefinal.txt`` (not ``feature.yaml``),
 and features are classified into 5 categories:
-  - non_seq_sparse       (scalar ID → bucketized)
-  - non_seq_sparse_bag   (multi-value ID array → bucketized + mask)
-  - non_seq_dense        (numeric → signed_log1p or raw)
-  - seq_sparse           (sequence of IDs → bucketized + mask)
-  - seq_dense            (sequence of numerics → signed_log1p + mask)
+  - non_seq_sparse       (scalar ID -> bucketized)
+  - non_seq_sparse_bag   (multi-value ID array -> bucketized + mask)
+  - non_seq_dense        (numeric -> signed_log1p or raw)
+  - seq_sparse           (sequence of IDs -> bucketized + mask)
+  - seq_dense            (sequence of numerics -> signed_log1p + mask)
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from pyarrow import fs
-from torch.utils.data import IterableDataset
+from torch.utils.data import IterableDataset, get_worker_info
 
 from utils.production_data import (
     ALREADY_LOGGED_FIELDS,
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# File discovery (local / HDFS) — copied from parquet_dataset.py to avoid
+# File discovery (local / HDFS) - copied from parquet_dataset.py to avoid
 # its broken ``from .feature_config import FeatureConfig`` import.
 # ---------------------------------------------------------------------------
 
@@ -290,11 +290,13 @@ class ProductionHDFSDataset(IterableDataset):
 
     def _extract_labels(self, columns: Dict[str, List[Any]], batch_size: int) -> np.ndarray:
         """Vectorized label extraction from label_click column."""
-        raw_list = columns.get(LABEL_COLUMN, [0] * batch_size)
+        if LABEL_COLUMN not in columns:
+            raise KeyError(f"Missing required label column: {LABEL_COLUMN}")
+        raw_list = columns[LABEL_COLUMN]
         return np.array([safe_int(first_scalar(v)) for v in raw_list], dtype=np.int64)
 
     # ------------------------------------------------------------------
-    # Core preprocessing — mirrors build_tensors() per-batch
+    # Core preprocessing - mirrors build_tensors() per-batch
     # ------------------------------------------------------------------
 
     def _preprocess_batch(self, batch_df: pd.DataFrame) -> Tuple[torch.Tensor, ...]:
@@ -407,6 +409,10 @@ class ProductionHDFSDataset(IterableDataset):
             rng = np.random.RandomState(self.seed)
             rng.shuffle(file_list)
             self.seed += 1  # different shuffle next epoch
+
+        worker_info = get_worker_info()
+        if worker_info is not None:
+            file_list = file_list[worker_info.id::worker_info.num_workers]
 
         if self.from_hdfs:
             self.hdfs_client = fs.HadoopFileSystem.from_uri(self.domain)

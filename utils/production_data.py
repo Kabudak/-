@@ -170,6 +170,8 @@ def load_parquet_columns(path: Path, max_rows: int | None = None) -> tuple[dict[
 def flatten_values(value: Any) -> list[Any]:
     if value is None:
         return []
+    if isinstance(value, np.ndarray):
+        return flatten_values(value.tolist())
     if isinstance(value, (list, tuple)):
         flattened: list[Any] = []
         for item in value:
@@ -181,6 +183,8 @@ def flatten_values(value: Any) -> list[Any]:
 def sequence_values(value: Any) -> list[Any]:
     if value is None:
         return []
+    if isinstance(value, np.ndarray):
+        return sequence_values(value.tolist())
     if isinstance(value, (list, tuple)) and len(value) == 1 and isinstance(value[0], (list, tuple)):
         return flatten_values(value[0])
     return flatten_values(value)
@@ -190,6 +194,8 @@ def first_scalar(value: Any) -> Any:
     if value is None:
         return None
     while isinstance(value, (list, tuple, np.ndarray)):
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
         if not value:
             return None
         value = value[0]
@@ -199,6 +205,8 @@ def first_scalar(value: Any) -> Any:
 def safe_float(value: Any) -> float:
     if value is None:
         return 0.0
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return safe_float(first_scalar(value))
     if isinstance(value, (int, float, np.integer, np.floating)):
         value = float(value)
         if math.isnan(value) or math.isinf(value):
@@ -221,6 +229,8 @@ def safe_float(value: Any) -> float:
 def safe_int(value: Any) -> int:
     if value is None:
         return 0
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return safe_int(first_scalar(value))
     if isinstance(value, (int, np.integer)):
         return int(value)
     if isinstance(value, (float, np.floating)):
@@ -632,7 +642,9 @@ def load_feature_schema(
 
 def label_from_columns(columns: dict[str, list[Any]], row_idx: int) -> int:
     """Extract binary label from label_click column."""
-    raw = first_scalar(columns.get(LABEL_COLUMN, [None])[row_idx])
+    if LABEL_COLUMN not in columns:
+        raise KeyError(f"Missing required label column: {LABEL_COLUMN}")
+    raw = first_scalar(columns[LABEL_COLUMN][row_idx])
     return safe_int(raw)
 
 
