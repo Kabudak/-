@@ -286,6 +286,7 @@ def main() -> None:
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
         loader_kwargs["persistent_workers"] = True
+        loader_kwargs["multiprocessing_context"] = "spawn"
     loader = DataLoader(dataset, **loader_kwargs)
     non_blocking_transfer = bool(loader_kwargs["pin_memory"])
 

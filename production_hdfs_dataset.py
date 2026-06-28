@@ -234,7 +234,7 @@ class ProductionHDFSDataset(IterableDataset):
         # ---- 5. Validate columns ----
         if self.files:
             self._validate_columns()
-
+        self.hdfs_client = None
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

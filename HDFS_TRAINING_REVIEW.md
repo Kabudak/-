@@ -165,17 +165,6 @@ HDFS 脚本之前默认 `--seq-len 100`，这会导致 impression 和 buy 序列
 
 这些指标比单纯看 AUC 更适合判断数据是否真的进了模型。
 
-### 2.8 代码文件 ASCII 清理
-
-因为公司环境可能拦截代码中的中文或异常字符，本次清理了 HDFS 相关 Python 文件里的非 ASCII 注释字符。
-
-当前检查结果：
-
-```text
-production_hdfs_dataset.py non_ascii_count 0
-scripts/run_production_hdfs.py non_ascii_count 0
-utils/production_data.py non_ascii_count 0
-```
 
 ## 3. 已完成的本地验证
 
