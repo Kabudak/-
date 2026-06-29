@@ -113,18 +113,15 @@ def print_batch_debug(batch_index: int, batch_tensors: tuple, logits: torch.Tens
 
 
 def move_batch_to_device(batch: tuple, device: str, non_blocking: bool = False):
-    """Move a batch of tensors to device, return unpacked tensors."""
-    non_seq_sparse, non_seq_sparse_bag, non_seq_sparse_bag_mask, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels = batch
-    return (
-        non_seq_sparse.to(device, non_blocking=non_blocking).long(),
-        non_seq_sparse_bag.to(device, non_blocking=non_blocking).long(),
-        non_seq_sparse_bag_mask.to(device, non_blocking=non_blocking),
-        non_seq_dense.to(device, non_blocking=non_blocking).float(),
-        seq_sparse.to(device, non_blocking=non_blocking).long(),
-        seq_dense.to(device, non_blocking=non_blocking).float(),
-        seq_mask.to(device, non_blocking=non_blocking),
-        labels.to(device, non_blocking=non_blocking).float(),
-    )
+    """Move a batch of tensors to device with no dtype conversions.
+
+    The dataset already produces tensors in the correct dtypes:
+      - sparse indices: int32 (accepted by nn.Embedding)
+      - dense values:   float32
+      - masks:          bool
+      - labels:         float32
+    """
+    return tuple(t.to(device, non_blocking=non_blocking) for t in batch)
 
 
 def forward_pass(
@@ -400,6 +397,18 @@ def main() -> None:
     best_test_auc = float("-inf")
     all_progressive_results = []
 
+    # CUDA stream for prefetching next batch onto GPU while the current
+    # batch is being trained – overlaps H2D transfer with computation.
+    use_cuda_prefetch = args.device.startswith("cuda")
+    prefetch_stream = torch.cuda.Stream() if use_cuda_prefetch else None
+
+    def _prefetch_to_device(raw_batch):
+        """Asynchronously move a batch to GPU on the prefetch stream."""
+        if use_cuda_prefetch:
+            with torch.cuda.stream(prefetch_stream):
+                return move_batch_to_device(raw_batch, args.device, non_blocking=True)
+        return move_batch_to_device(raw_batch, args.device, non_blocking=non_blocking_transfer)
+
     for epoch in range(1, args.epochs + 1):
         epoch_results = []
         loader_iter = iter(loader)
@@ -412,7 +421,9 @@ def main() -> None:
             print(f"[Epoch {epoch}] No data available, skipping.")
             break
 
-        batch_tensors = move_batch_to_device(first_raw, args.device, non_blocking=non_blocking_transfer)
+        batch_tensors = _prefetch_to_device(first_raw)
+        if use_cuda_prefetch:
+            torch.cuda.current_stream().wait_stream(prefetch_stream)
         batch_n = batch_tensors[-1].size(0)
 
         model.train()
@@ -449,13 +460,19 @@ def main() -> None:
 
         del batch_tensors, first_raw
 
-        buffered_raw = None
-        buffered_idx = None
+        buffered_raw = next(loader_iter, None)
+        buffered_idx = 1
+        prefetch_tensors = _prefetch_to_device(buffered_raw) if buffered_raw is not None else None
 
-        for idx, current_raw in enumerate(loader_iter, start=1):
-            if buffered_raw is not None:
-                batch_tensors = move_batch_to_device(buffered_raw, args.device, non_blocking=non_blocking_transfer)
+        for current_raw in loader_iter:
+            if prefetch_tensors is not None:
+                
+                if use_cuda_prefetch:
+                    torch.cuda.current_stream().wait_stream(prefetch_stream)
+                batch_tensors = prefetch_tensors
                 batch_n = batch_tensors[-1].size(0)
+
+                prefetch_tensors=_prefetch_to_device(current_raw)
 
                 run_eval = should_run_every(buffered_idx, args.eval_every_batches)
                 if run_eval:
@@ -521,11 +538,12 @@ def main() -> None:
 
                 del batch_tensors
 
-            buffered_raw = current_raw
-            buffered_idx = idx
+            buffered_idx += 1
 
-        if buffered_raw is not None:
-            batch_tensors = move_batch_to_device(buffered_raw, args.device, non_blocking=non_blocking_transfer)
+        if prefetch_tensors is not None:
+            if use_cuda_prefetch:
+                torch.cuda.current_stream().wait_stream(prefetch_stream)
+            batch_tensors = prefetch_tensors
             batch_n = batch_tensors[-1].size(0)
 
             model.eval()

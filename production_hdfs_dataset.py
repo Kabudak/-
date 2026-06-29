@@ -387,7 +387,7 @@ class ProductionHDFSDataset(IterableDataset):
         if LABEL_COLUMN not in columns:
             raise KeyError(f"Missing required label column: {LABEL_COLUMN}")
         raw_list = columns[LABEL_COLUMN]
-        return np.array([safe_int(first_scalar(v)) for v in raw_list], dtype=np.int64)
+        return np.array([safe_int(first_scalar(v)) for v in raw_list], dtype=np.float32)
 
     def _arrow_column_map(self, record_batch: Any) -> Dict[str, Any]:
         return {
@@ -509,7 +509,7 @@ class ProductionHDFSDataset(IterableDataset):
         labels_np = column_to_scalar(
             columns[LABEL_COLUMN],
             batch_size=B,
-            dtype=np.int64,
+            dtype=np.float32,
             reduction="first",
         )
 

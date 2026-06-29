@@ -248,10 +248,6 @@ moe_expert_hidden
 最大差值均为 0.0
 ```
 
-## 下一步测试方向
-
-下面的测试建议都应该在公司真实 HDFS/CUDA 机器上执行。本地 100 行数据只适合 smoke test。
-
 ### 1. Arrow 预处理正确性灰度
 
 目标：确认 Arrow 路径在生产 parquet 上不改变训练语义。
