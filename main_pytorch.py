@@ -67,6 +67,57 @@ class SwiGLUFeedForward(nn.Module):
         return self.out(torch.nn.functional.silu(gate) * value)
 
 
+class MoEFeedForward(nn.Module):
+    """Top-k routed SwiGLU experts with optional shared experts."""
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden_dim: int,
+        num_experts: int,
+        top_k: int,
+        shared_experts: int = 0,
+    ) -> None:
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError("num_experts must be positive")
+        if top_k <= 0 or top_k > num_experts:
+            raise ValueError("top_k must be in [1, num_experts]")
+        if shared_experts < 0:
+            raise ValueError("shared_experts must be non-negative")
+
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [SwiGLUFeedForward(d_model, hidden_dim) for _ in range(num_experts)]
+        )
+        self.shared = nn.ModuleList(
+            [SwiGLUFeedForward(d_model, hidden_dim) for _ in range(shared_experts)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        original_shape = x.shape
+        flat = x.reshape(-1, original_shape[-1])
+        gate_logits = self.gate(flat).float()
+        route_weight, route_idx = torch.topk(gate_logits, k=self.top_k, dim=-1)
+        route_weight = torch.softmax(route_weight, dim=-1).to(dtype=flat.dtype)
+
+        output = torch.zeros_like(flat)
+        for expert_idx, expert in enumerate(self.experts):
+            selected = route_idx == expert_idx
+            if selected.sum().item() == 0:
+                continue
+            token_idx, slot_idx = selected.nonzero(as_tuple=True)
+            expert_out = expert(flat[token_idx])
+            output[token_idx] += expert_out * route_weight[token_idx, slot_idx].unsqueeze(-1)
+
+        for shared_expert in self.shared:
+            output = output + shared_expert(flat)
+
+        return output.view(original_shape)
+
+
 class CrossAttentionBlock(nn.Module):
     def __init__(self, d_model: int, num_heads: int) -> None:
         super().__init__()
@@ -169,10 +220,22 @@ class SequenceRepresentationEncoder(nn.Module):
 
 
 class QueryBoostMixer(nn.Module):
-    def __init__(self, d_model: int, total_tokens: int, ffn_hidden: int) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        total_tokens: int,
+        ffn_hidden: int,
+        ffn_type: str = "swiglu",
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_shared_experts: int = 1,
+        moe_expert_hidden: int | None = None,
+    ) -> None:
         super().__init__()
         if total_tokens <= 0:
             raise ValueError("total_tokens must be positive")
+        if ffn_type not in {"swiglu", "moe"}:
+            raise ValueError("ffn_type must be either 'swiglu' or 'moe'")
         self.total_tokens = total_tokens
         self.mixer_dim = math.ceil(d_model / total_tokens) * total_tokens
         self.in_proj = nn.Identity() if self.mixer_dim == d_model else nn.Linear(d_model, self.mixer_dim)
@@ -180,10 +243,20 @@ class QueryBoostMixer(nn.Module):
         self.token_norm = nn.LayerNorm(self.mixer_dim)
         self.channel_norm = nn.LayerNorm(self.mixer_dim)
         hidden_dim = max(ffn_hidden, self.mixer_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(self.mixer_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.mixer_dim),
+        self.ffn = (
+            MoEFeedForward(
+                d_model=self.mixer_dim,
+                hidden_dim=max(moe_expert_hidden or ffn_hidden, self.mixer_dim),
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                shared_experts=moe_shared_experts,
+            )
+            if ffn_type == "moe"
+            else nn.Sequential(
+                nn.Linear(self.mixer_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.mixer_dim),
+            )
         )
 
         sub_dim = self.mixer_dim // total_tokens
@@ -237,6 +310,11 @@ class HyFormerLayer(nn.Module):
         ffn_hidden: int,
         encoder_type: str,
         short_seq_len: int,
+        ffn_type: str = "swiglu",
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_shared_experts: int = 1,
+        moe_expert_hidden: int | None = None,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -261,6 +339,11 @@ class HyFormerLayer(nn.Module):
             d_model=d_model,
             total_tokens=self.total_query_tokens + num_non_seq_tokens,
             ffn_hidden=ffn_hidden,
+            ffn_type=ffn_type,
+            moe_num_experts=moe_num_experts,
+            moe_top_k=moe_top_k,
+            moe_shared_experts=moe_shared_experts,
+            moe_expert_hidden=moe_expert_hidden,
         )
 
     def forward(
@@ -314,6 +397,11 @@ class HyFormerBackbone(nn.Module):
         ffn_hidden: int,
         encoder_type: str = "longer",
         short_seq_len: int = 8,
+        ffn_type: str = "swiglu",
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_shared_experts: int = 1,
+        moe_expert_hidden: int | None = None,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -327,6 +415,11 @@ class HyFormerBackbone(nn.Module):
                     ffn_hidden=ffn_hidden,
                     encoder_type=encoder_type,
                     short_seq_len=short_seq_len,
+                    ffn_type=ffn_type,
+                    moe_num_experts=moe_num_experts,
+                    moe_top_k=moe_top_k,
+                    moe_shared_experts=moe_shared_experts,
+                    moe_expert_hidden=moe_expert_hidden,
                 )
                 for _ in range(num_layers)
             ]

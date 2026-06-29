@@ -194,6 +194,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader worker count for streaming preprocessing.")
     parser.add_argument("--prefetch-factor", type=int, default=2, help="DataLoader prefetch factor when num_workers > 0.")
     parser.add_argument("--pin-memory", action="store_true", help="Use pinned host memory for faster CUDA transfers.")
+    parser.add_argument("--preprocess-engine", choices=("arrow", "pandas"), default="arrow")
+    parser.add_argument("--no-arrow-fallback", action="store_true", help="Fail instead of falling back to pandas if Arrow preprocessing cannot handle a batch.")
+    parser.add_argument("--validate-all-files", action="store_true", help="Validate every parquet file schema before training starts.")
+    parser.add_argument(
+        "--file-shuffle",
+        choices=("global", "none", "source_round_robin"),
+        default="global",
+        help="File ordering before streaming batches. global matches previous behavior.",
+    )
+    parser.add_argument("--debug-file-order", type=int, default=0, help="Print the first N parquet files in epoch order.")
     parser.add_argument("--seq-len", type=int, default=200, help="Global max sequence length.")
     parser.add_argument("--sequence-truncation", choices=("head", "tail"), default="tail")
     parser.add_argument("--non-seq-bag-len", type=int, default=64, help="Max length per non-seq sparse bag feature.")
@@ -225,6 +235,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-mlp-hidden", type=int, default=320)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ffn-hidden", type=int, default=128)
+    parser.add_argument("--ffn-type", choices=("swiglu", "moe"), default="swiglu")
+    parser.add_argument("--moe-num-experts", type=int, default=8)
+    parser.add_argument("--moe-top-k", type=int, default=2)
+    parser.add_argument("--moe-shared-experts", type=int, default=1)
+    parser.add_argument("--moe-expert-hidden", type=int, default=None)
     parser.add_argument("--hyformer-layers", type=int, default=2)
     parser.add_argument("--seq-encoder-type", choices=("longer", "full_transformer", "swiglu", "identity"), default="longer")
     parser.add_argument("--short-seq-len", type=int, default=16)
@@ -248,6 +263,44 @@ def parse_sequence_lens(raw_value: str | None) -> dict[str, int] | None:
     return result
 
 
+def make_dataset(
+    args: argparse.Namespace,
+    data_path: list[list[str]],
+    sequence_lens: dict[str, int] | None,
+) -> ProductionHDFSDataset:
+    return ProductionHDFSDataset(
+        data_path=data_path,
+        feature_file=args.feature_file,
+        from_hdfs=args.from_hdfs,
+        seq_len=args.seq_len,
+        sequence_truncation=args.sequence_truncation,
+        non_seq_bag_len=args.non_seq_bag_len,
+        sequence_lens=sequence_lens,
+        non_seq_array_reduction=args.non_seq_array_reduction,
+        batch_size=args.parquet_batch_size,
+        sample_rate=args.sample_rate,
+        split=None,
+        seed=args.seed,
+        preprocess_engine=args.preprocess_engine,
+        arrow_fallback_to_pandas=not args.no_arrow_fallback,
+        validate_all_files=args.validate_all_files,
+        file_shuffle=args.file_shuffle,
+    )
+
+
+def make_loader(args: argparse.Namespace, dataset: ProductionHDFSDataset) -> DataLoader:
+    loader_kwargs = {
+        "batch_size": None,
+        "num_workers": args.num_workers,
+        "pin_memory": args.pin_memory and args.device.startswith("cuda"),
+    }
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["multiprocessing_context"] = "spawn"
+    return DataLoader(dataset, **loader_kwargs)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -263,32 +316,13 @@ def main() -> None:
         sys.exit(1)
 
     # ---- Create single dataset (no train/valid split) ----
-    dataset = ProductionHDFSDataset(
-        data_path=data_path,
-        feature_file=args.feature_file,
-        from_hdfs=args.from_hdfs,
-        seq_len=args.seq_len,
-        sequence_truncation=args.sequence_truncation,
-        non_seq_bag_len=args.non_seq_bag_len,
-        sequence_lens=sequence_lens,
-        non_seq_array_reduction=args.non_seq_array_reduction,
-        batch_size=args.parquet_batch_size,
-        sample_rate=args.sample_rate,
-        split=None,
-        seed=args.seed,
-    )
-
-    loader_kwargs = {
-        "batch_size": None,
-        "num_workers": args.num_workers,
-        "pin_memory": args.pin_memory and args.device.startswith("cuda"),
-    }
-    if args.num_workers > 0:
-        loader_kwargs["prefetch_factor"] = args.prefetch_factor
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["multiprocessing_context"] = "spawn"
-    loader = DataLoader(dataset, **loader_kwargs)
-    non_blocking_transfer = bool(loader_kwargs["pin_memory"])
+    dataset = make_dataset(args, data_path, sequence_lens)
+    loader = make_loader(args, dataset)
+    non_blocking_transfer = bool(args.pin_memory and args.device.startswith("cuda"))
+    if args.debug_file_order > 0:
+        print("[data] train_file_order_preview=")
+        for idx, path in enumerate(dataset.preview_file_order(args.debug_file_order)):
+            print(f"  {idx:04d}: {path}")
 
     # ---- Build model from metadata ----
     metadata = dataset.get_metadata()
@@ -315,6 +349,11 @@ def main() -> None:
         token_mlp_hidden=args.token_mlp_hidden,
         sequence_fields=dict(metadata.get("sequence_fields", {})) or None,
         sequence_names=list(metadata.get("sequence_names", [])) or None,
+        ffn_type=args.ffn_type,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_shared_experts=args.moe_shared_experts,
+        moe_expert_hidden=args.moe_expert_hidden,
     ).to(args.device)
 
     # ---- Loss ----
@@ -323,13 +362,14 @@ def main() -> None:
         pos_weight = torch.tensor([args.pos_weight], dtype=torch.float32, device=args.device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
 
     # ---- Print config ----
     print(f"device={args.device} amp={amp_enabled}")
     print(
         f"from_hdfs={args.from_hdfs} parquet_batch_size={args.parquet_batch_size} "
-        f"num_workers={args.num_workers} pin_memory={loader_kwargs['pin_memory']}"
+        f"num_workers={args.num_workers} pin_memory={non_blocking_transfer} "
+        f"preprocess_engine={args.preprocess_engine} file_shuffle={args.file_shuffle}"
     )
     print(
         f"sequences={metadata['sequence_names']} non_seq_tokens={len(metadata['token_groups'])} "
@@ -338,8 +378,15 @@ def main() -> None:
     print(f"seq_len={metadata['seq_len']} sequence_lens={metadata.get('sequence_lens')}")
     print(
         f"d_model={args.d_model} layers={args.hyformer_layers} encoder={args.seq_encoder_type} "
-        f"field_embed_dim={args.field_embed_dim} token_mlp_hidden={args.token_mlp_hidden}"
+        f"field_embed_dim={args.field_embed_dim} token_mlp_hidden={args.token_mlp_hidden} "
+        f"ffn_type={args.ffn_type}"
     )
+    if args.ffn_type == "moe":
+        print(
+            f"moe_num_experts={args.moe_num_experts} moe_top_k={args.moe_top_k} "
+            f"moe_shared_experts={args.moe_shared_experts} "
+            f"moe_expert_hidden={args.moe_expert_hidden or args.ffn_hidden}"
+        )
     if pos_weight is not None:
         print(f"pos_weight={pos_weight.item():.4f}")
     else:
@@ -371,7 +418,7 @@ def main() -> None:
         model.train()
         optimizer.zero_grad(set_to_none=True)
         train_loss, train_logits = forward_pass(model, batch_tensors, criterion, args.device, amp_enabled)
-        
+
         if scaler is not None and amp_enabled:
             scaler.scale(train_loss).backward()
             scaler.step(optimizer)
@@ -379,7 +426,7 @@ def main() -> None:
         else:
             train_loss.backward()
             optimizer.step()
-            
+
         train_m = maybe_compute_metrics(train_logits, batch_tensors[-1], enabled=True)
         if args.debug_batches > 0:
             print_batch_debug(0, batch_tensors, train_logits)
@@ -402,25 +449,16 @@ def main() -> None:
 
         del batch_tensors, first_raw
 
-        # ================================================================
-        # Middle + last batches: use look-ahead buffer
-        #
-        # We buffer one batch ahead. When we see a new batch, the buffered
-        # one is guaranteed NOT to be the last -> eval + train.
-        # After the loop, the remaining buffered batch IS the last -> eval only.
-        # ================================================================
         buffered_raw = None
         buffered_idx = None
 
         for idx, current_raw in enumerate(loader_iter, start=1):
             if buffered_raw is not None:
-                # buffered_raw is NOT the last batch -> eval + train
                 batch_tensors = move_batch_to_device(buffered_raw, args.device, non_blocking=non_blocking_transfer)
                 batch_n = batch_tensors[-1].size(0)
 
                 run_eval = should_run_every(buffered_idx, args.eval_every_batches)
                 if run_eval:
-                    # --- Evaluate on buffered batch ---
                     model.eval()
                     with torch.no_grad():
                         eval_loss, eval_logits = forward_pass(model, batch_tensors, criterion, args.device, amp_enabled)
@@ -446,7 +484,6 @@ def main() -> None:
                         f"acc={format_metric(eval_m['accuracy'])}  n={batch_n}"
                     )
 
-                # --- Train on buffered batch ---
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
                 train_loss, train_logits = forward_pass(model, batch_tensors, criterion, args.device, amp_enabled)
@@ -484,13 +521,9 @@ def main() -> None:
 
                 del batch_tensors
 
-            # Buffer current batch for next iteration
             buffered_raw = current_raw
             buffered_idx = idx
 
-        # ================================================================
-        # Last batch (buffered_raw): eval only, no training
-        # ================================================================
         if buffered_raw is not None:
             batch_tensors = move_batch_to_device(buffered_raw, args.device, non_blocking=non_blocking_transfer)
             batch_n = batch_tensors[-1].size(0)
@@ -525,14 +558,12 @@ def main() -> None:
 
         all_progressive_results.extend(epoch_results)
 
-        # Track best test AUC across epochs
         test_results = [r for r in epoch_results if r["phase"] == "test"]
         if test_results:
             epoch_test_auc = test_results[-1]["auc"]
             if epoch_test_auc is not None and epoch_test_auc > best_test_auc:
                 best_test_auc = epoch_test_auc
 
-    # === Compute summary metrics ===
     pre_train_evals = [r for r in all_progressive_results if r["phase"] == "pre_train_eval"]
     test_evals = [r for r in all_progressive_results if r["phase"] == "test"]
     train_evals = [r for r in all_progressive_results if r["phase"] == "train"]

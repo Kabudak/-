@@ -349,6 +349,11 @@ class TAACHyFormerClassifier(nn.Module):
         token_mlp_hidden: int = 320,
         sequence_fields: dict[str, list[str]] | None = None,
         sequence_names: list[str] | None = None,
+        ffn_type: str = "swiglu",
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_shared_experts: int = 1,
+        moe_expert_hidden: int | None = None,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -430,6 +435,11 @@ class TAACHyFormerClassifier(nn.Module):
             ffn_hidden=ffn_hidden,
             encoder_type=seq_encoder_type,
             short_seq_len=short_seq_len,
+            ffn_type=ffn_type,
+            moe_num_experts=moe_num_experts,
+            moe_top_k=moe_top_k,
+            moe_shared_experts=moe_shared_experts,
+            moe_expert_hidden=moe_expert_hidden,
         )
         self.head = nn.Sequential(
             nn.LayerNorm(d_model * 2),

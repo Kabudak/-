@@ -43,6 +43,12 @@ from utils.production_data import (
     load_feature_schema,
     safe_int,
 )
+from utils.arrow_preprocess import (
+    column_to_dense_scalar,
+    column_to_fixed_matrix,
+    column_to_scalar,
+    column_to_sparse_scalar,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +144,10 @@ class ProductionHDFSDataset(IterableDataset):
         split: Optional[str] = None,
         train_fraction: float = 0.857,
         seed: int = 2024,
+        preprocess_engine: str = "arrow",
+        arrow_fallback_to_pandas: bool = True,
+        validate_all_files: bool = False,
+        file_shuffle: str = "global",
     ):
         """
         Args:
@@ -155,14 +165,33 @@ class ProductionHDFSDataset(IterableDataset):
             split: "train", "valid", or None (use all files)
             train_fraction: fraction of files for training
             seed: random seed for file shuffling
+            preprocess_engine: "arrow" uses Arrow/NumPy batch kernels, "pandas"
+                uses the legacy pandas/object conversion path
+            arrow_fallback_to_pandas: fall back to the legacy path if Arrow
+                preprocessing hits an unsupported column shape
+            validate_all_files: validate every parquet file schema instead of
+                one representative file per data source
+            file_shuffle: "global" shuffles all files together, "none" keeps
+                data-path argument order, and "source_round_robin" alternates
+                files from each data-path source
         """
         super().__init__()
+        if preprocess_engine not in {"arrow", "pandas"}:
+            raise ValueError("preprocess_engine must be either 'arrow' or 'pandas'")
+        if file_shuffle not in {"global", "none", "source_round_robin"}:
+            raise ValueError("file_shuffle must be one of: global, none, source_round_robin")
         self.from_hdfs = from_hdfs
         self.batch_size = batch_size
         self.seed = seed
         self.non_seq_array_reduction = non_seq_array_reduction
+        self.preprocess_engine = preprocess_engine
+        self.arrow_fallback_to_pandas = arrow_fallback_to_pandas
+        self.validate_all_files = validate_all_files
+        self.file_shuffle = file_shuffle
+        self._arrow_fallback_warned = False
         self.domain: str | None = None
         self.hdfs_client: fs.HadoopFileSystem | None = None
+        self.data_path = data_path
 
         # ---- 1. Load feature schema from selectedfeaturefinal.txt ----
         self.schema = load_feature_schema(
@@ -181,18 +210,21 @@ class ProductionHDFSDataset(IterableDataset):
             all_files, self.domain = get_files_hdfs(data_path)
         else:
             all_files = get_files_local(data_path)
+        self.file_groups = all_files
+        self.source_file_counts = [len(source_files) for source_files in all_files]
 
-        # Merge all data sources into a single file list
-        merged: List[str] = []
+        # Merge all data sources into a single file list.
+        ordered_merged: List[str] = []
         for source_files in all_files:
-            merged.extend(source_files)
-        merged.sort()
+            ordered_merged.extend(source_files)
+        merged = list(ordered_merged) if file_shuffle != "global" else sorted(ordered_merged)
 
         # Apply sample rate
         if 0 < sample_rate < 1.0:
+            original_count = len(merged)
             keep = max(int(sample_rate * len(merged)), 1)
             merged = merged[:keep]
-            logger.info(f"[production_hdfs] sample_rate={sample_rate}, keeping {keep}/{len(merged)} files")
+            logger.info(f"[production_hdfs] sample_rate={sample_rate}, keeping {keep}/{original_count} files")
 
         # Train/valid split at file level
         if split is not None:
@@ -214,6 +246,8 @@ class ProductionHDFSDataset(IterableDataset):
         logger.info(
             f"[production_hdfs] split={split} files={len(self.files)} "
             f"from_hdfs={from_hdfs} batch_size={batch_size} "
+            f"preprocess_engine={preprocess_engine} "
+            f"file_shuffle={file_shuffle} "
             f"seq_len={self.schema.seq_len} "
             f"non_seq_sparse={len(self.schema.non_seq_sparse_fields)} "
             f"non_seq_sparse_bag={len(self.schema.non_seq_sparse_bag_fields)} "
@@ -250,36 +284,52 @@ class ProductionHDFSDataset(IterableDataset):
         cols.update(self.schema.seq_dense_fields)
         return sorted(cols)
 
-    def _validate_columns(self) -> None:
-        """Check that the first parquet file contains all required columns."""
-        first_file = self.files[0]
-        try:
-            if self.from_hdfs:
-                if self.hdfs_client is None:
-                    self.hdfs_client = fs.HadoopFileSystem.from_uri(self.domain)
-                native_file = self.hdfs_client.open_input_file(first_file)
-                parquet_schema = pq.ParquetFile(native_file).schema_arrow
+    def _schema_for_file(self, file_path: str) -> Any:
+        if self.from_hdfs:
+            if self.hdfs_client is None:
+                self.hdfs_client = fs.HadoopFileSystem.from_uri(self.domain)
+            native_file = self.hdfs_client.open_input_file(file_path)
+            try:
+                return pq.ParquetFile(native_file).schema_arrow
+            finally:
                 native_file.close()
-            else:
-                parquet_schema = pq.ParquetFile(first_file).schema_arrow
+        return pq.ParquetFile(file_path).schema_arrow
 
-            parquet_columns = set(parquet_schema.names)
+    def _validation_files(self) -> List[str]:
+        if self.validate_all_files:
+            return list(self.files)
+        representatives: List[str] = []
+        for source_files in self.file_groups:
+            if source_files:
+                representatives.append(source_files[0])
+        if not representatives and self.files:
+            representatives.append(self.files[0])
+        return representatives
+
+    def _validate_columns(self) -> None:
+        """Check required columns in representative parquet files."""
+        validation_files = self._validation_files()
+        try:
             required = set(self.all_columns)
-            missing = required - parquet_columns
-            if missing:
-                raise KeyError(
-                    f"Feature schema requires columns missing from parquet: "
-                    f"{sorted(missing)}. "
-                    f"Available ({len(parquet_columns)}): {sorted(parquet_columns)[:20]}..."
-                )
+            for file_path in validation_files:
+                parquet_schema = self._schema_for_file(file_path)
+                parquet_columns = set(parquet_schema.names)
+                missing = required - parquet_columns
+                if missing:
+                    raise KeyError(
+                        f"Feature schema requires columns missing from parquet: "
+                        f"{sorted(missing)}. "
+                        f"Checked file: {file_path}. "
+                        f"Available ({len(parquet_columns)}): {sorted(parquet_columns)[:20]}..."
+                    )
             logger.info(
                 f"[production_hdfs] column validation passed: {len(required)} columns "
-                f"all found in {first_file}"
+                f"checked in {len(validation_files)} file(s)"
             )
         except Exception as e:
             if isinstance(e, KeyError):
                 raise
-            logger.warning(f"[production_hdfs] could not validate columns from {first_file}: {e}")
+            logger.warning(f"[production_hdfs] could not validate parquet columns: {e}")
 
     def _open_file(self, file_path: str) -> Tuple[pq.ParquetFile, Any]:
         """Open a single parquet file, returning (ParquetFile, native_file|None)."""
@@ -288,12 +338,62 @@ class ProductionHDFSDataset(IterableDataset):
         else:
             return pq.ParquetFile(file_path), None
 
+    def _selected_file_groups(self) -> List[List[str]]:
+        selected = set(self.files)
+        return [
+            [file_path for file_path in source_files if file_path in selected]
+            for source_files in self.file_groups
+        ]
+
+    def _round_robin_files(self, rng: np.random.RandomState) -> List[str]:
+        groups = [list(source_files) for source_files in self._selected_file_groups()]
+        for group in groups:
+            if len(group) > 1:
+                rng.shuffle(group)
+
+        ordered: List[str] = []
+        cursor = [0 for _ in groups]
+        while True:
+            made_progress = False
+            for group_idx, group in enumerate(groups):
+                if cursor[group_idx] >= len(group):
+                    continue
+                ordered.append(group[cursor[group_idx]])
+                cursor[group_idx] += 1
+                made_progress = True
+            if not made_progress:
+                break
+        return ordered
+
+    def _make_file_order(self, seed: int) -> List[str]:
+        file_list = list(self.files)
+        if len(file_list) <= 1 or self.file_shuffle == "none":
+            return file_list
+
+        rng = np.random.RandomState(seed)
+        if self.file_shuffle == "source_round_robin":
+            return self._round_robin_files(rng)
+
+        rng.shuffle(file_list)
+        return file_list
+
+    def preview_file_order(self, limit: int = 20) -> List[str]:
+        if limit <= 0:
+            return []
+        return self._make_file_order(self.seed)[:limit]
+
     def _extract_labels(self, columns: Dict[str, List[Any]], batch_size: int) -> np.ndarray:
         """Vectorized label extraction from label_click column."""
         if LABEL_COLUMN not in columns:
             raise KeyError(f"Missing required label column: {LABEL_COLUMN}")
         raw_list = columns[LABEL_COLUMN]
         return np.array([safe_int(first_scalar(v)) for v in raw_list], dtype=np.int64)
+
+    def _arrow_column_map(self, record_batch: Any) -> Dict[str, Any]:
+        return {
+            name: record_batch.column(idx)
+            for idx, name in enumerate(record_batch.schema.names)
+        }
 
     # ------------------------------------------------------------------
     # Core preprocessing - mirrors build_tensors() per-batch
@@ -398,16 +498,135 @@ class ProductionHDFSDataset(IterableDataset):
             torch.from_numpy(labels_np),
         )
 
+    def _preprocess_record_batch(self, record_batch: Any) -> Tuple[torch.Tensor, ...]:
+        """Convert an Arrow RecordBatch into tensors without pandas objects."""
+        B = record_batch.num_rows
+        schema = self.schema
+        columns = self._arrow_column_map(record_batch)
+
+        if LABEL_COLUMN not in columns:
+            raise KeyError(f"Missing required label column: {LABEL_COLUMN}")
+        labels_np = column_to_scalar(
+            columns[LABEL_COLUMN],
+            batch_size=B,
+            dtype=np.int64,
+            reduction="first",
+        )
+
+        non_seq_sparse_np = np.zeros((B, len(schema.non_seq_sparse_fields)), dtype=np.int32)
+        for idx, field in enumerate(schema.non_seq_sparse_fields):
+            non_seq_sparse_np[:, idx] = column_to_sparse_scalar(
+                columns[field],
+                batch_size=B,
+                bucket_size=bucket_size_for_field(field),
+                reduction="last",
+            )
+
+        non_seq_sparse_bag_np = np.zeros(
+            (B, len(schema.non_seq_sparse_bag_fields), schema.non_seq_bag_len),
+            dtype=np.int32,
+        )
+        non_seq_sparse_bag_mask_np = np.zeros_like(non_seq_sparse_bag_np, dtype=bool)
+        for idx, field in enumerate(schema.non_seq_sparse_bag_fields):
+            matrix, mask = column_to_fixed_matrix(
+                columns[field],
+                batch_size=B,
+                width=schema.non_seq_bag_len,
+                truncation=schema.sequence_truncation,
+                dtype=np.int32,
+                bucket_size=bucket_size_for_field(field),
+                sparse_mask=True,
+            )
+            non_seq_sparse_bag_np[:, idx, :] = matrix
+            non_seq_sparse_bag_mask_np[:, idx, :] = mask
+
+        non_seq_dense_np = np.zeros((B, len(schema.non_seq_dense_specs)), dtype=np.float32)
+        for idx, spec in enumerate(schema.non_seq_dense_specs):
+            non_seq_dense_np[:, idx] = column_to_dense_scalar(
+                columns[spec.source],
+                batch_size=B,
+                already_logged=spec.source in ALREADY_LOGGED_FIELDS,
+                reduction=self.non_seq_array_reduction,
+            )
+
+        max_seq_len = schema.seq_len
+        num_sequences = len(schema.sequence_names)
+        seq_sparse_np = np.zeros(
+            (B, num_sequences, max_seq_len, len(schema.seq_sparse_fields)),
+            dtype=np.int32,
+        )
+        seq_dense_np = np.zeros(
+            (B, num_sequences, max_seq_len, len(schema.seq_dense_fields)),
+            dtype=np.float32,
+        )
+        seq_mask_np = np.zeros((B, num_sequences, max_seq_len), dtype=bool)
+
+        for branch_idx, branch_name in enumerate(schema.sequence_names):
+            branch_len = schema.sequence_lens[branch_name]
+            backbone_field = schema.sequence_backbone_fields[branch_name]
+            for field in schema.sequence_fields[branch_name]:
+                if field in self._seq_sparse_set:
+                    field_idx = self._seq_sparse_index[field]
+                    matrix, mask = column_to_fixed_matrix(
+                        columns[field],
+                        batch_size=B,
+                        width=branch_len,
+                        truncation=schema.sequence_truncation,
+                        dtype=np.int32,
+                        bucket_size=bucket_size_for_field(field),
+                        sparse_mask=True,
+                    )
+                    seq_sparse_np[:, branch_idx, :branch_len, field_idx] = matrix
+                    if field == backbone_field:
+                        seq_mask_np[:, branch_idx, :branch_len] = mask
+                else:
+                    field_idx = self._seq_dense_index[field]
+                    matrix, mask = column_to_fixed_matrix(
+                        columns[field],
+                        batch_size=B,
+                        width=branch_len,
+                        truncation=schema.sequence_truncation,
+                        dtype=np.float32,
+                        already_logged=field in ALREADY_LOGGED_FIELDS,
+                    )
+                    seq_dense_np[:, branch_idx, :branch_len, field_idx] = matrix
+                    if field == backbone_field:
+                        seq_mask_np[:, branch_idx, :branch_len] = mask
+
+        return (
+            torch.from_numpy(non_seq_sparse_np),
+            torch.from_numpy(non_seq_sparse_bag_np),
+            torch.from_numpy(non_seq_sparse_bag_mask_np),
+            torch.from_numpy(non_seq_dense_np),
+            torch.from_numpy(seq_sparse_np),
+            torch.from_numpy(seq_dense_np),
+            torch.from_numpy(seq_mask_np),
+            torch.from_numpy(labels_np),
+        )
+
+    def _preprocess_any_batch(self, record_batch: Any) -> Tuple[torch.Tensor, ...]:
+        if self.preprocess_engine == "pandas":
+            return self._preprocess_batch(record_batch.to_pandas())
+        try:
+            return self._preprocess_record_batch(record_batch)
+        except Exception as exc:
+            if not self.arrow_fallback_to_pandas:
+                raise
+            if not self._arrow_fallback_warned:
+                logger.warning(
+                    "[production_hdfs] Arrow preprocessing failed; falling back to pandas path. "
+                    f"First error: {exc}"
+                )
+                self._arrow_fallback_warned = True
+            return self._preprocess_batch(record_batch.to_pandas())
+
     # ------------------------------------------------------------------
     # Iteration
     # ------------------------------------------------------------------
 
     def __iter__(self):
-        # Shuffle train files each epoch
-        file_list = list(self.files)
-        if len(file_list) > 1:
-            rng = np.random.RandomState(self.seed)
-            rng.shuffle(file_list)
+        file_list = self._make_file_order(self.seed)
+        if len(file_list) > 1 and self.file_shuffle != "none":
             self.seed += 1  # different shuffle next epoch
 
         worker_info = get_worker_info()
@@ -424,8 +643,7 @@ class ProductionHDFSDataset(IterableDataset):
                     for record_batch in pq_file.iter_batches(
                         batch_size=self.batch_size, columns=self.all_columns
                     ):
-                        batch_df = record_batch.to_pandas()
-                        yield self._preprocess_batch(batch_df)
+                        yield self._preprocess_any_batch(record_batch)
                 finally:
                     if native_file is not None:
                         try:
@@ -481,6 +699,15 @@ class ProductionHDFSDataset(IterableDataset):
                 "sparse_bag": sorted(NS_SPARSE_BAG_FIELDS),
                 "dense_array_reduction": self.non_seq_array_reduction,
                 "sparse_scalar_array_reduction": "last",
+            },
+            "streaming": {
+                "preprocess_engine": self.preprocess_engine,
+                "arrow_fallback_to_pandas": self.arrow_fallback_to_pandas,
+                "validate_all_files": self.validate_all_files,
+                "file_shuffle": self.file_shuffle,
+                "data_path_groups": self.data_path,
+                "source_file_counts": self.source_file_counts,
+                "total_files": len(self.files),
             },
             "notes": {
                 "label": f"Binary label from {LABEL_COLUMN} column.",

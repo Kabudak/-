@@ -26,11 +26,19 @@ Feature vectors are embedded to `field_embed_dim` first, concatenated inside eac
 Run progressive streaming training from HDFS:
 
 ```bash
-python scripts/run_production_hdfs.py --data-path hdfs://namenode:8020/path/to/day --feature-file data/selectedfeaturefinal.txt --parquet-batch-size 4096 --seq-len 200 --sequence-lens click_seq=100,impression_seq=200,buy_seq=200 --non-seq-bag-len 64 --non-seq-array-reduction last --amp --num-workers 2 --pin-memory --prefetch-factor 2 --debug-batches 5 --eval-every-batches 20 --train-metrics-every 20 --save-checkpoint
+python scripts/run_production_hdfs.py --data-path hdfs://namenode:8020/path/to/day --feature-file data/selectedfeaturefinal.txt --parquet-batch-size 4096 --preprocess-engine arrow --seq-len 200 --sequence-lens click_seq=100,impression_seq=200,buy_seq=200 --non-seq-bag-len 64 --non-seq-array-reduction last --amp --num-workers 2 --pin-memory --prefetch-factor 2 --debug-batches 5 --eval-every-batches 20 --train-metrics-every 20 --save-checkpoint
 ```
 
 Use `--debug-batches` on the first platform run to verify label positive rate, sparse non-zero rate, sequence mask length, dense value scale, and logits scale.
 Use `--eval-every-batches 1 --train-metrics-every 1` only when every-batch metrics are needed, because every AUC/logloss computation copies tensors back to CPU.
+Use `--preprocess-engine pandas` to temporarily return to the legacy object-conversion path if Arrow preprocessing needs to be isolated.
+Use `--file-shuffle none --debug-file-order 20` to test whether multi-hour file ordering or global file shuffle is affecting training.
+
+Run the MoE comparison entrypoint on the same streaming setup:
+
+```bash
+python scripts/run_production_hdfs_moe.py --data-path hdfs://namenode:8020/path/to/hr=00 --data-path hdfs://namenode:8020/path/to/hr=01 --data-path hdfs://namenode:8020/path/to/hr=02 --data-path hdfs://namenode:8020/path/to/hr=03 --feature-file data/selectedfeaturefinal.txt --parquet-batch-size 4096 --preprocess-engine arrow --seq-len 200 --sequence-lens click_seq=100,impression_seq=200,buy_seq=200 --non-seq-bag-len 64 --non-seq-array-reduction last --amp --num-workers 2 --pin-memory --prefetch-factor 2 --moe-num-experts 8 --moe-top-k 2 --moe-shared-experts 1 --train-metrics-every 20 --save-checkpoint
+```
 
 ## Public Taobao Ad Data
 
